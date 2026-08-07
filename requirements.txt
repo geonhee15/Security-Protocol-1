@@ -3,3 +3,4 @@ opencv-python>=4.10
 numpy
 pyobjc-framework-Quartz
 pyobjc-framework-Cocoa
+pyobjc-framework-AVFoundation

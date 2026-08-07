@@ -36,10 +36,41 @@ cd Security-Protocol-1
 
 ### 권한 (최초 1회)
 
-시스템 설정 → 개인정보 보호 및 보안에서, 이 프로그램을 실행하는 터미널 앱에:
+`./install-autostart.sh`로 앱 번들을 만든 뒤에는 **SecurityProtocol1.app** 이름으로 권한을 부여한다:
 
-1. **카메라** — 첫 실행 시 팝업 허용
-2. **손쉬운 사용(Accessibility)** — 입력 차단에 필요. 없으면 락다운 시도가 자동 취소됨
+1. **카메라** — 첫 실행 시 뜨는 팝업을 허용
+2. **손쉬운 사용(Accessibility)** — 시스템 설정 → 개인정보 보호 및 보안 → 손쉬운 사용에서 `+`로 `SecurityProtocol1.app` 추가. 입력 차단에 필요하며, 없으면 락다운 시도가 자동 취소된다(Basso 오류음)
+
+앱 번들 없이 `venv` python으로 직접 실행할 때는 대신 실행 주체인 터미널 앱(Terminal/iTerm)에 같은 두 권한이 필요하다.
+
+## 해제 시도 횟수 제한
+
+해제 제스처를 틀릴 때마다 카운트가 1씩 올라가고, **5회 실패하면 락다운을 유지한 채 macOS 잠금화면으로 전환**된다. 즉 그 이상 시도하려면 **맥 로그인 비밀번호가 필요**하므로 제스처 조합을 무한정 찍어볼 수 없다. 비밀번호로 세션에 복귀하면(= 본인 확인됨) 카운트만 0으로 리셋되고 락다운은 그대로 유지된다. HUD 우측 하단에 `ATTEMPTS LEFT 3/5`가 실시간 표시된다. 횟수는 `max_unlock_attempts`로 조절.
+
+## 폰에서 원격 조종
+
+알림용과 **별개의 비밀 topic**을 구독해, 폰에서 ntfy 메시지 한 줄로 맥을 조종한다. 메시지 형식은 `<token> <command>`:
+
+| 명령 | 동작 |
+|---|---|
+| `lock` | 원격 락다운 발동 (자리 비울 때) |
+| `unlock` | 원격 해제 — 제스처 인식이 안 될 때의 **두 번째 탈출구** |
+| `snap` | 지금 카메라 사진을 찍어 폰으로 전송 (누가 내 책상에 있는지 확인) |
+| `status` | 현재 상태·실패 횟수·침입 건수 응답 |
+
+폰 ntfy 앱에서 명령 topic을 열고 메시지를 보내면 된다. 토큰이 틀린 명령이 오면 무시하고 **"topic 유출 의심" 경고 알림**을 보낸다.
+
+> ⚠️ 명령 topic과 토큰을 아는 사람은 맥을 원격 해제할 수 있다. 알림 topic과 반드시 다른 이름을 쓰고, 원격 해제가 부담되면 `remote.allow_unlock`을 `false`로 두면 된다.
+
+## 로그인 시 자동 시작
+
+```bash
+./install-autostart.sh     # 설치 (해제: ./uninstall-autostart.sh)
+```
+
+재부팅·로그아웃 후에도 자동으로 감시가 시작된다. 중복 실행은 파일 락으로 차단되므로 수동 실행과 겹쳐도 안전하다.
+
+**앱 번들에 대하여** — macOS는 앱 번들이 아닌 맨 바이너리에는 카메라 권한 팝업을 띄우지 않는다(launchd 실행 시 즉시 거부됨). 그래서 설치 시 `SecurityProtocol1.app`이라는 최소 앱 번들을 만들어 ad-hoc 서명하고, 자동 시작과 수동 실행(`start.sh`)이 **같은 번들을 사용**한다. 덕분에 권한은 한 번만 부여하면 된다.
 
 ## 침입 블랙박스 & 폰 알림
 
@@ -57,6 +88,7 @@ cd Security-Protocol-1
   "trigger_hold_sec": 1.5,
   "unlock_sequence": ["Thumb_Up", "ILoveYou", "Thumb_Up"],
   "step_hold_sec": 0.8,
+  "max_unlock_attempts": 5,
   "emergency_keycode": 37,
   "emergency_modifiers": ["control", "option", "command"],
   "notify": {
@@ -64,6 +96,12 @@ cd Security-Protocol-1
     "ntfy_topic": "",
     "telegram_bot_token": "",
     "telegram_chat_id": ""
+  },
+  "remote": {
+    "enabled": false,
+    "ntfy_command_topic": "",
+    "token": "",
+    "allow_unlock": true
   }
 }
 ```

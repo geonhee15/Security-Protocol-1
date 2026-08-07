@@ -7,6 +7,9 @@ protocol.log
 # 침입자 스냅샷 (얼굴 사진 — 절대 커밋 금지)
 intruders/
 
+# 단일 실행 락
+.security_protocol.lock
+
 # 환경
 venv/
 __pycache__/
@@ -16,5 +19,12 @@ __pycache__/
 # 모델 (setup.sh가 다운로드)
 models/
 
-# 머신 종속 파일
-com.geonhee.security-protocol-1.plist
+# 머신 종속 파일 (install-autostart.sh가 생성)
+*.plist
+
+# 자동 시작 로그
+autostart.log
+
+# 생성되는 앱 번들
+SecurityProtocol1.app/
+.app-pythonpath

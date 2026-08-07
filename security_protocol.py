@@ -25,6 +25,8 @@ config.example.json을 복사해서 원하는 값으로 수정).
 import collections
 import ctypes
 import datetime
+import fcntl
+import hmac
 import json
 import math
 import os
@@ -35,12 +37,17 @@ import threading
 import time
 import traceback
 
+# OpenCV가 카메라 권한을 스레드에서 요청하면 실패한다 (launchd 실행 시 특히).
+# 권한은 아래 ensure_camera_access()가 메인 스레드에서 직접 처리한다.
+os.environ.setdefault("OPENCV_AVFOUNDATION_SKIP_AUTH", "1")
+
 import cv2
 import numpy as np
 import mediapipe as mp
 from mediapipe.tasks.python import BaseOptions, vision
 
 import AppKit
+import AVFoundation
 import objc
 import Quartz
 from PyObjCTools import AppHelper
@@ -78,8 +85,11 @@ def _load_config():
 
 CONFIG, CONFIG_SRC = _load_config()
 NOTIFY = CONFIG.get("notify", {})      # 폰 알림 설정 (provider: none/ntfy/telegram)
+REMOTE = CONFIG.get("remote", {})      # 폰 원격 조종 설정
 INTRUDER_DIR = os.path.join(BASE_DIR, "intruders")
 INTRUSION_COOLDOWN_SEC = 8.0           # 침입 스냅샷 최소 간격 (스팸 방지)
+MAX_UNLOCK_ATTEMPTS = int(CONFIG.get("max_unlock_attempts", 5))
+LOCK_FILE = os.path.join(BASE_DIR, ".security_protocol.lock")
 TRIGGER_GESTURE = CONFIG.get("trigger_gesture", "Thumb_Down")
 TRIGGER_HOLD_SEC = float(CONFIG.get("trigger_hold_sec", 1.5))
 UNLOCK_SEQUENCE = list(CONFIG.get("unlock_sequence",
@@ -183,6 +193,41 @@ def accessibility_trusted():
         return True   # 판정 불가 시 일단 진행
 
 
+def ensure_camera_access(timeout=30.0):
+    """메인 스레드에서 카메라 권한을 확보한다.
+
+    OpenCV는 권한 요청을 워커 스레드에서 시도하다 실패하므로(특히 launchd로
+    실행될 때) AVFoundation으로 직접 요청한다. 최초 1회 시스템 팝업이 뜬다.
+    """
+    media = AVFoundation.AVMediaTypeVideo
+    status = AVFoundation.AVCaptureDevice.authorizationStatusForMediaType_(media)
+    if status == 3:            # AVAuthorizationStatusAuthorized
+        return True
+    if status in (1, 2):       # restricted / denied
+        log("[!] 카메라 권한이 거부되어 있습니다.")
+        log("    시스템 설정 → 개인정보 보호 및 보안 → 카메라에서")
+        log(f"    {sys.executable} 을 켜주세요.")
+        return False
+
+    # notDetermined → 팝업 요청 (콜백이 올 때까지 런루프를 돌린다)
+    log("카메라 권한 요청 중 — 팝업이 뜨면 허용해 주세요.")
+    result = {}
+
+    def handler(granted):
+        result["granted"] = bool(granted)
+
+    AVFoundation.AVCaptureDevice.requestAccessForMediaType_completionHandler_(
+        media, handler)
+    deadline = time.monotonic() + timeout
+    while "granted" not in result and time.monotonic() < deadline:
+        AppKit.NSRunLoop.currentRunLoop().runMode_beforeDate_(
+            AppKit.NSDefaultRunLoopMode,
+            AppKit.NSDate.dateWithTimeIntervalSinceNow_(0.1))
+    granted = result.get("granted", False)
+    log("카메라 권한 " + ("허용됨" if granted else "거부됨/시간초과"))
+    return granted
+
+
 def session_screen_locked():
     """macOS 잠금화면(로그인창) 상태인지."""
     d = Quartz.CGSessionCopyCurrentDictionary()
@@ -234,6 +279,7 @@ class HUDRenderer:
     def __init__(self):
         self.conf_hist = collections.deque(maxlen=200)
         self.intrusions = 0
+        self.fail_count = 0
         rng = random.Random(7)
         # 신경망 노드: (기준각, 반경비, 회전속도, 위상)
         self.nodes = [(rng.uniform(0, 2 * math.pi),
@@ -656,6 +702,18 @@ class HUDRenderer:
         self._t(canvas, f"INTRUSION ATTEMPTS  {self.intrusions:02d}", x0, 562,
                 0.28, icol)
 
+        # 남은 해제 시도 횟수 (소진 시 macOS 비밀번호 요구)
+        left = max(0, MAX_UNLOCK_ATTEMPTS - self.fail_count)
+        fcol = HUD_RED if self.fail_count else HUD_DIM
+        self._t(canvas, f"ATTEMPTS LEFT  {left}/{MAX_UNLOCK_ATTEMPTS}", x0, 578,
+                0.28, fcol)
+        for i in range(MAX_UNLOCK_ATTEMPTS):
+            x = x0 + 118 + i * 12
+            if i < left:
+                cv2.rectangle(canvas, (x, 571), (x + 8, 578), HUD_MAIN, -1)
+            else:
+                cv2.rectangle(canvas, (x, 571), (x + 8, 578), HUD_RED, 1)
+
 
 # ──────────────────────────── 제스처 안정화 ────────────────────────────
 class GestureStabilizer:
@@ -707,6 +765,8 @@ class GestureWatcher(threading.Thread):
         self.hud = HUDRenderer()
         self.last_capture_at = -1e9
         self.intrusion_count = 0
+        self.fail_count = 0          # 연속 해제 실패 횟수 (MAX_UNLOCK_ATTEMPTS에서 락아웃)
+        self.latest_frame = None     # 원격 스냅샷 명령용 최신 프레임
 
     def run(self):
         try:
@@ -751,6 +811,7 @@ class GestureWatcher(threading.Thread):
             if not ok:
                 time.sleep(0.1)
                 continue
+            self.latest_frame = frame    # 원격 스냅샷 명령용
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
             ts_ms = int((time.monotonic() - t0) * 1000)
@@ -779,6 +840,12 @@ class GestureWatcher(threading.Thread):
                 self.app.macos_screen_locked = screen_locked_cache
                 if was and not screen_locked_cache:
                     cooldown_until = now + COOLDOWN_SEC
+                    # 맥 비밀번호로 본인 확인됨 → 실패 카운트 리셋
+                    if self.fail_count:
+                        log(f"macOS 비밀번호 확인됨 → 해제 실패 카운트 리셋 "
+                            f"({self.fail_count} → 0)")
+                        self.fail_count = 0
+                        self.hud.fail_count = 0
                     log("macOS 잠금 해제 감지"
                         + (" → 락다운 유지" if locked else " → 쿨다운 시작"))
 
@@ -790,6 +857,8 @@ class GestureWatcher(threading.Thread):
                 seq_index = 0
                 if not locked:
                     cooldown_until = now + COOLDOWN_SEC
+                    self.fail_count = 0
+                    self.hud.fail_count = 0
 
             candidate, held = stab.update(gesture, now)
 
@@ -856,9 +925,20 @@ class GestureWatcher(threading.Thread):
                         log(f"해제 단계 {seq_index}/{len(UNLOCK_SEQUENCE)} 성공")
                 elif (candidate not in ("None", expected)
                         and held >= STEP_HOLD_SEC):
-                    # 잘못된 해제 제스처 → 침입 시도로 기록
+                    # 잘못된 해제 제스처 → 실패 카운트 + 침입 기록
                     stab.consume(now)
+                    seq_index = 0        # 시퀀스는 처음부터 다시
+                    self.fail_count += 1
+                    self.hud.fail_count = self.fail_count
+                    log(f"[FAIL] 해제 실패 {self.fail_count}/{MAX_UNLOCK_ATTEMPTS}")
                     self._capture_intruder(frame, "WRONG_GESTURE", now)
+                    if self.fail_count >= MAX_UNLOCK_ATTEMPTS:
+                        log(f"[LOCKOUT] 해제 {MAX_UNLOCK_ATTEMPTS}회 실패 "
+                            "→ macOS 잠금화면으로 전환 (락다운 유지)")
+                        play(SOUND_ERROR)
+                        notify(f"SP-1 LOCKOUT // 해제 {MAX_UNLOCK_ATTEMPTS}회 실패 "
+                               "→ macOS 비밀번호 요구")
+                        AppHelper.callAfter(self.app.lockoutToLoginWindow)
             else:
                 if screen_locked_cache:
                     continue
@@ -895,6 +975,114 @@ class GestureWatcher(threading.Thread):
             notify(f"SP-1 INTRUSION ATTEMPT // {reason}", photo_path=path)
         except Exception:
             log("[!] 침입 기록 실패:\n" + traceback.format_exc())
+
+
+# ──────────────────────────── 원격 명령 수신 (폰 → ntfy → 맥) ────────────────────────────
+class RemoteListener(threading.Thread):
+    """ntfy 명령 topic을 구독해 폰에서 보낸 명령을 실행한다.
+
+    메시지 형식:  "<token> <command>"   (token은 config의 remote.token)
+    명령: lock / unlock / snap / status
+
+    보안: 명령 topic은 알림 topic과 반드시 다른 비밀 이름이어야 하고,
+    token이 틀리면 무시 + 경고 알림을 보낸다 (topic 유출 감지).
+    """
+
+    COMMANDS = ("lock", "unlock", "snap", "status")
+
+    def __init__(self, app, watcher):
+        super().__init__(daemon=True)
+        self.app = app
+        self.watcher = watcher
+        self.stop_flag = threading.Event()
+        self.topic = REMOTE.get("ntfy_command_topic", "")
+        self.token = str(REMOTE.get("token", ""))
+        self.started_at = time.time()
+
+    def run(self):
+        url = f"https://ntfy.sh/{self.topic}/json"
+        log(f"원격 명령 수신 시작 (topic: {self.topic[:6]}…)")
+        backoff = 2
+        while not self.stop_flag.is_set():
+            try:
+                proc = subprocess.Popen(
+                    ["curl", "-sN", "--no-buffer", "--max-time", "3600", url],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                backoff = 2
+                for raw in proc.stdout:
+                    if self.stop_flag.is_set():
+                        break
+                    self._handle_line(raw)
+                proc.terminate()
+            except Exception:
+                log("[!] 원격 수신 오류:\n" + traceback.format_exc())
+            if not self.stop_flag.is_set():
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 60)
+
+    def _handle_line(self, raw):
+        try:
+            msg = json.loads(raw.decode("utf-8", "replace").strip() or "{}")
+        except ValueError:
+            return
+        if msg.get("event") != "message":
+            return                                  # open/keepalive 무시
+        if msg.get("time", 0) < self.started_at - 5:
+            return                                  # 캐시된 과거 메시지 무시
+        text = (msg.get("message") or "").strip()
+        parts = text.split()
+        if not parts:
+            return
+        # 토큰 검증
+        if self.token:
+            if len(parts) < 2 or not hmac.compare_digest(parts[0], self.token):
+                log("[REMOTE] 토큰 불일치 명령 무시 — 명령 topic이 유출됐을 수 있음")
+                notify("SP-1 REMOTE // 잘못된 토큰의 명령 수신 "
+                       "(명령 topic 유출 의심 — topic/토큰 교체 권장)")
+                return
+            cmd = parts[1].lower()
+        else:
+            cmd = parts[0].lower()
+        if cmd not in self.COMMANDS:
+            return
+        log(f"[REMOTE] 명령 수신: {cmd}")
+        self._dispatch(cmd)
+
+    def _dispatch(self, cmd):
+        if cmd == "lock":
+            AppHelper.callAfter(self.app.remoteLock)
+        elif cmd == "unlock":
+            AppHelper.callAfter(self.app.remoteUnlock)
+        elif cmd == "snap":
+            self._snap()
+        elif cmd == "status":
+            state = "LOCKED" if self.app.locked else "ARMED"
+            if self.app.locked:
+                state += f" ({self.app.stage})"
+            notify(f"SP-1 STATUS // {state} // "
+                   f"실패 {self.watcher.fail_count}/{MAX_UNLOCK_ATTEMPTS} // "
+                   f"침입 {self.watcher.intrusion_count}건")
+
+    def _snap(self):
+        frame = self.watcher.latest_frame
+        if frame is None:
+            notify("SP-1 SNAP // 카메라 프레임 없음")
+            return
+        try:
+            os.makedirs(INTRUDER_DIR, exist_ok=True)
+            ts = datetime.datetime.now()
+            path = os.path.join(INTRUDER_DIR, f"{ts:%Y%m%d_%H%M%S}_snap.jpg")
+            img = cv2.flip(frame, 1)
+            h, w = img.shape[:2]
+            cv2.rectangle(img, (0, h - 26), (w, h), (0, 0, 0), -1)
+            cv2.putText(img, f"SP-1 REMOTE SNAP // {ts:%Y-%m-%d %H:%M:%S}",
+                        (8, h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                        (255, 220, 60), 1, cv2.LINE_AA)
+            cv2.imwrite(path, img)
+            log(f"[REMOTE] 원격 스냅샷 → {os.path.basename(path)}")
+            notify(f"SP-1 REMOTE SNAP // {ts:%H:%M:%S}", photo_path=path)
+        except Exception:
+            log("[!] 원격 스냅샷 실패:\n" + traceback.format_exc())
 
 
 # ──────────────────────────── 메인 앱 (오버레이 + 입력 차단) ────────────────────────────
@@ -1080,10 +1268,52 @@ class SecurityApp(AppKit.NSObject):
             log("[OPEN] 락다운 해제")
             play(SOUND_UNLOCK)
 
+    def lockoutToLoginWindow(self):
+        """해제 시도 초과 → 락다운은 유지한 채 macOS 잠금화면으로 전환.
+
+        맥 비밀번호를 입력해야 세션에 돌아올 수 있고, 돌아와도 락다운은
+        그대로 유지된다 (실패 카운트만 리셋).
+        """
+        if not self.locked:
+            return
+        self.stage = "shade"
+        self.macos_screen_locked = True   # 탭이 비밀번호 입력을 막지 않도록
+        for v in self.button_views:
+            v.setHidden_(False)
+        for iv in self.preview_views:
+            iv.setHidden_(True)
+        shade = AppKit.NSColor.colorWithSRGBRed_green_blue_alpha_(
+            0.0, 0.0, 0.0, 0.62)
+        for win in self.windows:
+            win.setOpaque_(False)
+            win.setBackgroundColor_(shade)
+        native_lock_screen()
+
     def emergencyEscape(self):
         log("[ESC] 비상 키 조합 → 전체 정리 후 macOS 잠금화면으로 전환")
         self.unlock()
         native_lock_screen()
+
+    # ── 원격 명령 (폰 → ntfy → 맥) ──
+    def remoteLock(self):
+        if self.locked:
+            log("[REMOTE] lock 요청 — 이미 락다운 상태")
+            notify("SP-1 REMOTE // 이미 락다운 상태입니다")
+            return
+        log("[REMOTE] 원격 락다운 요청")
+        self.lockdown()
+
+    def remoteUnlock(self):
+        if not REMOTE.get("allow_unlock", True):
+            log("[REMOTE] unlock 요청 거부됨 (allow_unlock=false)")
+            notify("SP-1 REMOTE // 원격 해제가 설정에서 비활성화됨")
+            return
+        if not self.locked:
+            notify("SP-1 REMOTE // 락다운 상태가 아닙니다")
+            return
+        log("[REMOTE] 원격 해제 요청 → 락다운 해제")
+        self.unlock()
+        notify("SP-1 REMOTE // 락다운이 원격으로 해제되었습니다")
 
     def cameraFailed(self):
         if self.locked:
@@ -1239,12 +1469,36 @@ class SecurityApp(AppKit.NSObject):
         return label
 
 
+def acquire_single_instance_lock():
+    """중복 실행 방지 (자동 시작 + 수동 실행이 겹치는 상황 대비).
+
+    파일 락은 프로세스가 죽으면 커널이 자동 해제하므로 잔여 락이 남지 않는다.
+    """
+    fh = open(LOCK_FILE, "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return None
+    fh.write(str(os.getpid()))
+    fh.flush()
+    return fh   # 프로세스가 살아있는 동안 열어둔다
+
+
 def main():
     test_mode = "--test" in sys.argv
 
     if not os.path.exists(MODEL_PATH):
         print(f"[!] 모델 파일이 없습니다: {MODEL_PATH}")
         sys.exit(1)
+
+    lock_handle = acquire_single_instance_lock()
+    if lock_handle is None:
+        # 이미 다른 인스턴스가 감시 중 → 정상 종료(0)로 빠진다.
+        # launchd가 무한 재시작 루프를 돌지 않도록 실패가 아닌 성공으로 처리.
+        print("[!] 이미 실행 중입니다 — 이 인스턴스는 종료합니다.")
+        print("    기존 프로세스를 끄려면: pkill -f security_protocol.py")
+        sys.exit(0)
 
     app = AppKit.NSApplication.sharedApplication()
     app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
@@ -1274,8 +1528,21 @@ def main():
     AppKit.NSProcessInfo.processInfo().beginActivityWithOptions_reason_(
         0x00FFFFFF, "Security Protocol camera monitoring")
 
+    # 카메라 권한은 카메라 스레드를 띄우기 전에 메인 스레드에서 확보
+    if not ensure_camera_access():
+        log("[!] 카메라 권한 없이는 동작할 수 없습니다. 권한 부여 후 재시작하세요.")
+        sys.exit(1)
+
     watcher = GestureWatcher(controller, test_mode=test_mode)
     watcher.start()
+
+    if not test_mode and REMOTE.get("enabled") and \
+            REMOTE.get("ntfy_command_topic"):
+        if not REMOTE.get("token"):
+            log("[!] remote.token이 비어 있습니다 — 명령 topic을 아는 사람이면 "
+                "누구나 맥을 조종할 수 있습니다. 토큰 설정을 권장합니다.")
+        RemoteListener(controller, watcher).start()
+        log("  원격 명령: lock / unlock / snap / status")
 
     def swallow_error():
         log("[!] 이벤트 루프에서 예기치 못한 오류 발생 — 계속 진행")
