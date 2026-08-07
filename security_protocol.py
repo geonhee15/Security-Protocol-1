@@ -685,12 +685,12 @@ class GestureWatcher(threading.Thread):
 
         stab = GestureStabilizer()
         prev_locked = False
+        prev_stage = "shade"
         seq_index = 0             # 해제 시퀀스 진행 위치
         seq_started_at = 0.0
         cooldown_until = time.monotonic() + STARTUP_GRACE_SEC
         screen_locked_cache = False
         screen_checked_at = 0.0
-        last_status = ""
         last_logged = "None"
         frame_i = 0
         fps = 0.0
@@ -722,12 +722,23 @@ class GestureWatcher(threading.Thread):
                 fps = fps * 0.9 + (1.0 / dt) * 0.1
             locked = self.app.locked
 
+            # macOS 잠금화면 상태 (0.5초 스로틀) — 탭 콜백과 공유
+            if now - screen_checked_at > 0.5:
+                screen_checked_at = now
+                was = screen_locked_cache
+                screen_locked_cache = session_screen_locked()
+                self.app.macos_screen_locked = screen_locked_cache
+                if was and not screen_locked_cache:
+                    cooldown_until = now + COOLDOWN_SEC
+                    log("macOS 잠금 해제 감지"
+                        + (" → 락다운 유지" if locked else " → 쿨다운 시작"))
+
             # 락 상태가 바뀌면 상태머신 리셋 (+ 해제 직후 쿨다운)
             if locked != prev_locked:
                 prev_locked = locked
+                prev_stage = "shade"
                 stab.consume(now)
                 seq_index = 0
-                last_status = ""
                 if not locked:
                     cooldown_until = now + COOLDOWN_SEC
 
@@ -747,6 +758,18 @@ class GestureWatcher(threading.Thread):
                 last_logged = candidate
 
             if locked:
+                if screen_locked_cache:
+                    continue   # 맥 잠금화면 중에는 동결 (락다운은 유지됨)
+
+                # 셰이드 단계(UNLOCK 버튼 대기)에서는 HUD/시퀀스 비활성
+                stage = self.app.stage
+                if stage != prev_stage:
+                    prev_stage = stage
+                    stab.consume(now)
+                    seq_index = 0
+                if stage != "auth":
+                    continue
+
                 # 오버레이에 HUD 프레임 전송 (3프레임마다, 미러링)
                 frame_i += 1
                 if frame_i % 3 == 0:
@@ -777,14 +800,6 @@ class GestureWatcher(threading.Thread):
                         play(SOUND_STEP)
                         log(f"해제 단계 {seq_index}/{len(UNLOCK_SEQUENCE)} 성공")
             else:
-                # macOS 잠금화면 상태 확인 (1초 스로틀)
-                if now - screen_checked_at > 1.0:
-                    screen_checked_at = now
-                    was = screen_locked_cache
-                    screen_locked_cache = session_screen_locked()
-                    if was and not screen_locked_cache:
-                        cooldown_until = now + COOLDOWN_SEC
-                        log("macOS 잠금 해제 감지 → 쿨다운 시작")
                 if screen_locked_cache:
                     continue
                 if now < cooldown_until:
@@ -804,9 +819,13 @@ class SecurityApp(AppKit.NSObject):
         if self is None:
             return None
         self.locked = False
+        self.stage = "shade"            # "shade"(UNLOCK 버튼 대기) | "auth"(HUD 인증)
+        self.macos_screen_locked = False
         self.windows = []
         self.status_labels = []
         self.preview_views = []
+        self.button_views = []
+        self.button_rect = None         # UNLOCK 버튼 (CG 전역 좌표, x0,y0,x1,y1)
         self.tap = None
         self.tap_source = None
         self.overlay_miss = 0
@@ -827,6 +846,29 @@ class SecurityApp(AppKit.NSObject):
                     if self.locked and self.tap is not None:
                         Quartz.CGEventTapEnable(self.tap, True)
                     return None
+                # 맥 잠금화면 중에는 전부 통과 (비밀번호 입력 방해 금지,
+                # 락다운 오버레이/탭은 세션 복귀 후 그대로 유지).
+                # 클릭/키다운은 스테일 플래그 방지를 위해 실시간 재확인.
+                if self.macos_screen_locked:
+                    if type_ in (Quartz.kCGEventLeftMouseDown,
+                                 Quartz.kCGEventRightMouseDown,
+                                 Quartz.kCGEventKeyDown):
+                        if session_screen_locked():
+                            return event
+                        self.macos_screen_locked = False  # 복귀 확정 → 차단 재개
+                    else:
+                        return event
+                # 커서 이동은 허용 (UNLOCK 버튼을 조준할 수 있도록)
+                if type_ == Quartz.kCGEventMouseMoved:
+                    return event
+                # 셰이드 단계: UNLOCK 버튼 영역 안의 클릭만 인식 (이벤트는 삼킴)
+                if (type_ == Quartz.kCGEventLeftMouseDown
+                        and self.stage == "shade" and self.button_rect):
+                    loc = Quartz.CGEventGetLocation(event)
+                    x0, y0, x1, y1 = self.button_rect
+                    if x0 <= loc.x <= x1 and y0 <= loc.y <= y1:
+                        AppHelper.callAfter(self.enterAuthStage)
+                    return None
                 if type_ == Quartz.kCGEventKeyDown:
                     keycode = Quartz.CGEventGetIntegerValueField(
                         event, Quartz.kCGKeyboardEventKeycode)
@@ -836,7 +878,7 @@ class SecurityApp(AppKit.NSObject):
                         AppHelper.callAfter(self.emergencyEscape)
             except Exception:
                 pass
-            return None  # 모든 입력 삼킴
+            return None  # 그 외 모든 입력 삼킴
 
         self.tap = Quartz.CGEventTapCreate(
             Quartz.kCGSessionEventTap,
@@ -879,6 +921,7 @@ class SecurityApp(AppKit.NSObject):
         if self.locked:
             return
         log("[LOCK] 오버레이 표시 시도")
+        self.stage = "shade"
         shown = self._showOverlays()
         if shown == 0:
             log("[!] 오버레이 생성 실패 → 락다운 취소 (벽돌 방지)")
@@ -911,10 +954,28 @@ class SecurityApp(AppKit.NSObject):
         self._destroyTap()
         self._closeOverlays()
 
+    def enterAuthStage(self):
+        """셰이드 단계에서 UNLOCK 버튼 클릭 → 풀스크린 HUD 인증 화면으로 전환."""
+        if not self.locked or self.stage == "auth":
+            return
+        self.stage = "auth"
+        log("[LOCK] UNLOCK 선택 → 생체 인증 화면 진입")
+        play(SOUND_STEP)
+        navy = AppKit.NSColor.colorWithSRGBRed_green_blue_alpha_(
+            0.010, 0.035, 0.090, 1.0)
+        for win in self.windows:
+            win.setOpaque_(True)
+            win.setBackgroundColor_(navy)
+        for v in self.button_views:
+            v.setHidden_(True)
+        for iv in self.preview_views:
+            iv.setHidden_(False)
+
     def unlock(self):
         """어떤 상태에서 불려도 탭과 오버레이를 완전히 정리한다 (멱등)."""
         was = self.locked
         self.locked = False
+        self.stage = "shade"
         self._destroyTap()
         self._closeOverlays()
         if was:
@@ -936,6 +997,10 @@ class SecurityApp(AppKit.NSObject):
 
     # ── 워치독: 2초마다 상태 불변식 점검 ──
     def watchdogTick_(self, timer):
+        # 맥 잠금화면 중에는 판정 유예 — 오버레이가 WindowServer 목록에서
+        # 빠져 보여도 락다운을 풀지 않는다 (전원 버튼 → 비번 복귀 시 유지)
+        if session_screen_locked():
+            return
         if not self.locked:
             if self.tap is not None:
                 log("[!] 워치독: 잠금 아님 상태에서 이벤트 탭 발견 → 강제 제거")
@@ -976,6 +1041,11 @@ class SecurityApp(AppKit.NSObject):
         if main is not None:
             fr = main.frame()
             self.hud_size = (int(fr.size.width), int(fr.size.height))
+        # UNLOCK 버튼 히트 영역 (CG 전역 좌표: 주 화면 중앙, 220x56)
+        if self.hud_size:
+            W, H = self.hud_size
+            self.button_rect = (W / 2 - 110, H / 2 - 28,
+                                W / 2 + 110, H / 2 + 28)
         shown = 0
         for screen in AppKit.NSScreen.screens():
             try:
@@ -992,10 +1062,12 @@ class SecurityApp(AppKit.NSObject):
             AppKit.NSBackingStoreBuffered, False)
         win.setReleasedWhenClosed_(False)
         win.setLevel_(level)
+        # 1단계(셰이드): 원래 화면 위에 살짝 불투명한 검은 오버레이
         win.setBackgroundColor_(
             AppKit.NSColor.colorWithSRGBRed_green_blue_alpha_(
-                0.010, 0.035, 0.090, 1.0))
-        win.setOpaque_(True)
+                0.0, 0.0, 0.0, 0.62))
+        win.setOpaque_(False)
+        win.setHasShadow_(False)
         win.setIgnoresMouseEvents_(True)
         win.setCollectionBehavior_(
             AppKit.NSWindowCollectionBehaviorCanJoinAllSpaces
@@ -1005,11 +1077,40 @@ class SecurityApp(AppKit.NSObject):
         content = win.contentView()
         w, h = frame.size.width, frame.size.height
 
-        # 풀스크린 HUD 프레임 (모든 UI는 HUD 렌더러가 그린다)
+        # 2단계(auth)용 풀스크린 HUD 프레임 — 셰이드 단계에서는 숨김
         preview = AppKit.NSImageView.alloc().initWithFrame_(((0, 0), (w, h)))
         preview.setImageScaling_(AppKit.NSImageScaleProportionallyUpOrDown)
+        preview.setHidden_(True)
         content.addSubview_(preview)
         self.preview_views.append(preview)
+
+        # 주 화면에만 UNLOCK 버튼 표시 (클릭 감지는 이벤트 탭이 좌표로 처리)
+        if frame.origin.x == 0 and frame.origin.y == 0:
+            cyan = AppKit.NSColor.colorWithSRGBRed_green_blue_alpha_(
+                0.35, 0.85, 1.0, 1.0)
+            bw, bh = 220, 56
+            box = AppKit.NSView.alloc().initWithFrame_(
+                (((w - bw) / 2, (h - bh) / 2), (bw, bh)))
+            box.setWantsLayer_(True)
+            layer = box.layer()
+            layer.setBorderWidth_(1.0)
+            layer.setBorderColor_(cyan.CGColor())
+            layer.setCornerRadius_(6.0)
+            layer.setBackgroundColor_(
+                AppKit.NSColor.colorWithSRGBRed_green_blue_alpha_(
+                    0.01, 0.05, 0.12, 0.85).CGColor())
+            lbl = self._label("UNLOCK", 20, cyan, bold=True)
+            lbl.setFrame_(((0, 14), (bw, 28)))
+            box.addSubview_(lbl)
+            content.addSubview_(box)
+            self.button_views.append(box)
+
+            cap = self._label("SECURITY PROTOCOL 1  //  SYSTEM LOCKED", 13,
+                              AppKit.NSColor.colorWithSRGBRed_green_blue_alpha_(
+                                  0.55, 0.78, 0.90, 0.9))
+            cap.setFrame_(((0, (h - bh) / 2 + bh + 18), (w, 20)))
+            content.addSubview_(cap)
+            self.button_views.append(cap)
 
         win.orderFrontRegardless()
         self.windows.append(win)
@@ -1020,6 +1121,8 @@ class SecurityApp(AppKit.NSObject):
         self.windows = []
         self.status_labels = []
         self.preview_views = []
+        self.button_views = []
+        self.button_rect = None
 
     @staticmethod
     def _label(text, size, color, bold=False):
