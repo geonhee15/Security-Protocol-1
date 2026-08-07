@@ -1,0 +1,17 @@
+# 개인 보안 설정 (제스처/비상키) — 절대 커밋 금지
+config.local.json
+
+# 런타임 로그 (제스처 기록 포함)
+protocol.log
+
+# 환경
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# 모델 (setup.sh가 다운로드)
+models/
+
+# 머신 종속 파일
+com.geonhee.security-protocol-1.plist
