@@ -77,6 +77,9 @@ def _load_config():
 
 
 CONFIG, CONFIG_SRC = _load_config()
+NOTIFY = CONFIG.get("notify", {})      # 폰 알림 설정 (provider: none/ntfy/telegram)
+INTRUDER_DIR = os.path.join(BASE_DIR, "intruders")
+INTRUSION_COOLDOWN_SEC = 8.0           # 침입 스냅샷 최소 간격 (스팸 방지)
 TRIGGER_GESTURE = CONFIG.get("trigger_gesture", "Thumb_Down")
 TRIGGER_HOLD_SEC = float(CONFIG.get("trigger_hold_sec", 1.5))
 UNLOCK_SEQUENCE = list(CONFIG.get("unlock_sequence",
@@ -128,6 +131,47 @@ def log(msg):
 def play(path):
     subprocess.Popen(["afplay", path],
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def notify(message, photo_path=None):
+    """폰 푸시 알림 (curl 비동기 — 메인 흐름을 절대 막지 않음).
+
+    ntfy: 폰에 ntfy 앱 설치 후 topic 구독만 하면 끝 (계정 불필요).
+    telegram: BotFather로 만든 봇 토큰 + chat_id 필요.
+    """
+    provider = NOTIFY.get("provider", "none")
+    try:
+        if provider == "telegram":
+            token = NOTIFY.get("telegram_bot_token", "")
+            chat = str(NOTIFY.get("telegram_chat_id", ""))
+            if not token or not chat:
+                return
+            if photo_path:
+                cmd = ["curl", "-sf", "-m", "20",
+                       "-F", f"chat_id={chat}", "-F", f"caption={message}",
+                       "-F", f"photo=@{photo_path}",
+                       f"https://api.telegram.org/bot{token}/sendPhoto"]
+            else:
+                cmd = ["curl", "-sf", "-m", "20",
+                       "-F", f"chat_id={chat}", "-F", f"text={message}",
+                       f"https://api.telegram.org/bot{token}/sendMessage"]
+        elif provider == "ntfy":
+            topic = NOTIFY.get("ntfy_topic", "")
+            if not topic:
+                return
+            url = f"https://ntfy.sh/{topic}"
+            if photo_path:
+                cmd = ["curl", "-sf", "-m", "20", "-T", photo_path,
+                       "-H", f"Title: {message}",
+                       "-H", "Filename: intruder.jpg", url]
+            else:
+                cmd = ["curl", "-sf", "-m", "20", "-d", message, url]
+        else:
+            return
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
 
 
 def accessibility_trusted():
@@ -189,6 +233,7 @@ class HUDRenderer:
 
     def __init__(self):
         self.conf_hist = collections.deque(maxlen=200)
+        self.intrusions = 0
         rng = random.Random(7)
         # 신경망 노드: (기준각, 반경비, 회전속도, 위상)
         self.nodes = [(rng.uniform(0, 2 * math.pi),
@@ -605,9 +650,11 @@ class HUDRenderer:
         cv2.line(canvas, (x0, 490), (px1 - 10, 490), HUD_GRID, 1)
 
         for i, s in enumerate(("ID    GH-0209", "MODE  GESTURE-AUTH",
-                               "LINK  CAM-01 SECURE", "GRID  STABLE",
-                               "PWR   NOMINAL")):
+                               "LINK  CAM-01 SECURE", "GRID  STABLE")):
             self._t(canvas, s, x0, 506 + i * 14, 0.28, HUD_FAINT)
+        icol = HUD_RED if self.intrusions else HUD_FAINT
+        self._t(canvas, f"INTRUSION ATTEMPTS  {self.intrusions:02d}", x0, 562,
+                0.28, icol)
 
 
 # ──────────────────────────── 제스처 안정화 ────────────────────────────
@@ -658,6 +705,8 @@ class GestureWatcher(threading.Thread):
         self.test_mode = test_mode
         self.stop_flag = threading.Event()
         self.hud = HUDRenderer()
+        self.last_capture_at = -1e9
+        self.intrusion_count = 0
 
     def run(self):
         try:
@@ -761,6 +810,12 @@ class GestureWatcher(threading.Thread):
                 if screen_locked_cache:
                     continue   # 맥 잠금화면 중에는 동결 (락다운은 유지됨)
 
+                # 침입 블랙박스: 탭 콜백이 감지한 입력 시도 → 스냅샷
+                reason = self.app.intrusion_pending
+                if reason:
+                    self.app.intrusion_pending = None
+                    self._capture_intruder(frame, reason, now)
+
                 # 셰이드 단계(UNLOCK 버튼 대기)에서는 HUD/시퀀스 비활성
                 stage = self.app.stage
                 if stage != prev_stage:
@@ -799,6 +854,11 @@ class GestureWatcher(threading.Thread):
                     else:
                         play(SOUND_STEP)
                         log(f"해제 단계 {seq_index}/{len(UNLOCK_SEQUENCE)} 성공")
+                elif (candidate not in ("None", expected)
+                        and held >= STEP_HOLD_SEC):
+                    # 잘못된 해제 제스처 → 침입 시도로 기록
+                    stab.consume(now)
+                    self._capture_intruder(frame, "WRONG_GESTURE", now)
             else:
                 if screen_locked_cache:
                     continue
@@ -811,6 +871,32 @@ class GestureWatcher(threading.Thread):
 
         cap.release()
 
+    def _capture_intruder(self, frame, reason, now):
+        """침입 시도 순간의 카메라 스냅샷을 저장하고 폰으로 전송."""
+        if now - self.last_capture_at < INTRUSION_COOLDOWN_SEC:
+            return
+        self.last_capture_at = now
+        self.intrusion_count += 1
+        self.hud.intrusions = self.intrusion_count
+        try:
+            os.makedirs(INTRUDER_DIR, exist_ok=True)
+            ts = datetime.datetime.now()
+            path = os.path.join(
+                INTRUDER_DIR, f"{ts:%Y%m%d_%H%M%S}_{reason.lower()}.jpg")
+            img = cv2.flip(frame, 1)
+            h, w = img.shape[:2]
+            cv2.rectangle(img, (0, h - 26), (w, h), (0, 0, 0), -1)
+            cv2.putText(img,
+                        f"SP-1 INTRUSION // {reason} // {ts:%Y-%m-%d %H:%M:%S}",
+                        (8, h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                        (60, 60, 255), 1, cv2.LINE_AA)
+            cv2.imwrite(path, img)
+            log(f"[ALERT] 침입 시도 기록: {reason} → {os.path.basename(path)}")
+            notify(f"SP-1 INTRUSION ATTEMPT // {reason}", photo_path=path)
+        except Exception:
+            log("[!] 침입 기록 실패:\n" + traceback.format_exc())
+
+
 # ──────────────────────────── 메인 앱 (오버레이 + 입력 차단) ────────────────────────────
 class SecurityApp(AppKit.NSObject):
 
@@ -821,6 +907,7 @@ class SecurityApp(AppKit.NSObject):
         self.locked = False
         self.stage = "shade"            # "shade"(UNLOCK 버튼 대기) | "auth"(HUD 인증)
         self.macos_screen_locked = False
+        self.intrusion_pending = None   # 탭이 감지한 차단 입력 → 카메라 스레드가 스냅샷
         self.windows = []
         self.status_labels = []
         self.preview_views = []
@@ -868,7 +955,7 @@ class SecurityApp(AppKit.NSObject):
                     x0, y0, x1, y1 = self.button_rect
                     if x0 <= loc.x <= x1 and y0 <= loc.y <= y1:
                         AppHelper.callAfter(self.enterAuthStage)
-                    return None
+                        return None
                 if type_ == Quartz.kCGEventKeyDown:
                     keycode = Quartz.CGEventGetIntegerValueField(
                         event, Quartz.kCGKeyboardEventKeycode)
@@ -876,6 +963,15 @@ class SecurityApp(AppKit.NSObject):
                     if (keycode == EMERGENCY_KEYCODE
                             and (flags & EMERGENCY_FLAGS) == EMERGENCY_FLAGS):
                         AppHelper.callAfter(self.emergencyEscape)
+                        return None
+                # 그 외 차단되는 실제 입력(키/클릭)은 침입 시도로 플래그
+                if type_ in (Quartz.kCGEventKeyDown,
+                             Quartz.kCGEventLeftMouseDown,
+                             Quartz.kCGEventRightMouseDown):
+                    if self.intrusion_pending is None:
+                        self.intrusion_pending = (
+                            "KEYBOARD" if type_ == Quartz.kCGEventKeyDown
+                            else "MOUSE")
             except Exception:
                 pass
             return None  # 그 외 모든 입력 삼킴
@@ -947,6 +1043,8 @@ class SecurityApp(AppKit.NSObject):
             return
         log(f"[LOCK] 오버레이 {onscreen}개 화면 표시 확인 → 입력 차단 활성화")
         play(SOUND_LOCK)
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        notify(f"SP-1 LOCKDOWN ENGAGED // {ts}")
 
     def _cancelLockdown(self):
         play(SOUND_ERROR)

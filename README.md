@@ -41,6 +41,14 @@ cd Security-Protocol-1
 1. **카메라** — 첫 실행 시 팝업 허용
 2. **손쉬운 사용(Accessibility)** — 입력 차단에 필요. 없으면 락다운 시도가 자동 취소됨
 
+## 침입 블랙박스 & 폰 알림
+
+- **침입 블랙박스** — 락다운 중 잘못된 해제 제스처를 하거나 키보드·마우스를 누르면, 그 순간 카메라 스냅샷을 `intruders/`(gitignore됨)에 시각·사유와 함께 저장한다. HUD 우측 하단에 `INTRUSION ATTEMPTS`가 누적 표시된다. (스팸 방지 8초 쿨다운)
+- **폰 알림** — 락다운 발동·침입 시도 시 폰으로 푸시. 침입 시에는 침입자 사진까지 전송된다. `config.local.json`의 `notify.provider`로 선택:
+  - `ntfy` — 폰에 [ntfy](https://ntfy.sh) 앱 설치 후 원하는 topic 구독만 하면 끝 (계정 불필요). `ntfy_topic`에 추측 어려운 이름을 넣을 것.
+  - `telegram` — [@BotFather](https://t.me/botfather)로 봇 생성 → `telegram_bot_token`, 봇과 대화 시작 후 `telegram_chat_id` 입력.
+  - `none` — 알림 끔 (기본값).
+
 ## 설정 — `config.local.json`
 
 ```json
@@ -50,7 +58,13 @@ cd Security-Protocol-1
   "unlock_sequence": ["Thumb_Up", "ILoveYou", "Thumb_Up"],
   "step_hold_sec": 0.8,
   "emergency_keycode": 37,
-  "emergency_modifiers": ["control", "option", "command"]
+  "emergency_modifiers": ["control", "option", "command"],
+  "notify": {
+    "provider": "none",
+    "ntfy_topic": "",
+    "telegram_bot_token": "",
+    "telegram_chat_id": ""
+  }
 }
 ```
 

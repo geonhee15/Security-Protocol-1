@@ -4,6 +4,9 @@ config.local.json
 # 런타임 로그 (제스처 기록 포함)
 protocol.log
 
+# 침입자 스냅샷 (얼굴 사진 — 절대 커밋 금지)
+intruders/
+
 # 환경
 venv/
 __pycache__/
