@@ -107,7 +107,7 @@ SOUND_ERROR = "/System/Library/Sounds/Basso.aiff"    # 락다운 취소/오류
 
 GESTURE_EMOJI = {"Closed_Fist": "✊", "Open_Palm": "✋", "Victory": "✌️",
                  "Pointing_Up": "☝️", "Thumb_Up": "👍", "Thumb_Down": "👎",
-                 "ILoveYou": "🤟", "None": "·"}   # 터미널/로그용 (락다운 UI에는 미사용)
+                 "ILoveYou": "🤟", "Double_Clap": "👏", "None": "·"}   # 터미널/로그용 (락다운 UI에는 미사용)
 
 # MediaPipe 21개 손 랜드마크 연결 (스켈레톤)
 HAND_CONNECTIONS = [(0, 1), (1, 2), (2, 3), (3, 4),
@@ -753,6 +753,97 @@ class GestureStabilizer:
         self.seen = now
 
 
+class ClapDetector:
+    """양손 랜드마크로 '박수 두 번'(더블 클랩) 트리거를 감지한다.
+
+    박수 1회 = 두 손이 **빠르게** 접근 → 접촉(손 크기 대비 손바닥 간격이 임계
+    이하) → 다시 분리. 오작동을 막는 장치:
+
+    - 접근 속도 게이트: 기도 자세처럼 천천히 손을 모으는 동작은 무시
+    - 접촉 지속 상한: 손을 계속 붙이고 있으면(깍지 등) 박수로 치지 않음
+    - 히스테리시스(접촉/분리 임계 분리): 경계에서 떨려도 중복 카운트 없음
+    - 접촉 → 분리가 완료되어야 1회 — 스치기만 한 것도 무시
+    - 두 번의 박수가 0.15~1.2초 간격일 때만 발동, 늦으면 처음부터
+    - 발동 후에는 기존 락다운 쿨다운이 재발동을 막음
+    """
+
+    CONTACT_R = 0.65        # 접촉: 손바닥 중심 간 거리 < 손크기 × 0.65
+    RELEASE_R = 1.15        # 분리: 손크기 × 1.15 이상 벌어져야 함
+    MIN_APPROACH = 2.2      # 접촉 직전 최소 접근 속도 (손크기/초)
+    MAX_CONTACT_SEC = 0.5   # 이보다 오래 붙어있으면 박수 아님
+    GAP_MIN = 0.15          # 두 박수 사이 최소 간격 (바운스 무시)
+    GAP_MAX = 1.2           # 두 박수 사이 최대 간격
+
+    def __init__(self):
+        self.state = "apart"
+        self.contact_at = 0.0
+        self.last_clap_at = -10.0
+        self.approach = 0.0
+        self.prev_dist = None
+        self.prev_t = None
+        self.claps = 0
+
+    @staticmethod
+    def _palm(hand):
+        xs = ys = 0.0
+        for i in (0, 5, 9, 13, 17):
+            xs += hand[i].x
+            ys += hand[i].y
+        return xs / 5.0, ys / 5.0
+
+    @staticmethod
+    def _size(hand):
+        return math.hypot(hand[0].x - hand[9].x,
+                          hand[0].y - hand[9].y) or 1e-3
+
+    def update(self, hands, now):
+        """매 프레임 호출. 더블 클랩이 완성된 순간에만 True."""
+        if hands is None or len(hands) < 2:
+            self.state = "apart"
+            self.prev_dist = None
+            self.approach = 0.0
+            if self.claps and now - self.last_clap_at > self.GAP_MAX:
+                self.claps = 0
+            return False
+
+        (ax, ay) = self._palm(hands[0])
+        (bx, by) = self._palm(hands[1])
+        ref = (self._size(hands[0]) + self._size(hands[1])) / 2.0
+        dist = math.hypot(ax - bx, ay - by) / ref
+
+        if self.prev_dist is not None and self.prev_t is not None:
+            dt = max(1e-3, now - self.prev_t)
+            speed = (self.prev_dist - dist) / dt   # +면 접근 중
+            self.approach += (speed - self.approach) * 0.5
+        self.prev_dist = dist
+        self.prev_t = now
+
+        fired = False
+        if self.state == "apart":
+            if dist < self.CONTACT_R and self.approach > self.MIN_APPROACH:
+                self.state = "contact"
+                self.contact_at = now
+        elif self.state == "contact":
+            if now - self.contact_at > self.MAX_CONTACT_SEC:
+                self.state = "hold"      # 너무 오래 붙어있음 → 이번 접촉 무효
+            elif dist > self.RELEASE_R:
+                gap = now - self.last_clap_at
+                if self.claps == 1 and self.GAP_MIN <= gap <= self.GAP_MAX:
+                    self.claps = 0
+                    fired = True
+                else:
+                    self.claps = 1       # 첫 박수 (또는 창을 벗어난 재시작)
+                self.last_clap_at = now
+                self.state = "apart"
+        elif self.state == "hold":
+            if dist > self.RELEASE_R:
+                self.state = "apart"
+
+        if self.claps == 1 and now - self.last_clap_at > self.GAP_MAX:
+            self.claps = 0
+        return fired
+
+
 # ──────────────────────────── 제스처 감시 스레드 ────────────────────────────
 class GestureWatcher(threading.Thread):
     """카메라 프레임을 읽어 제스처를 분류하고 상태머신을 돌린다."""
@@ -779,7 +870,7 @@ class GestureWatcher(threading.Thread):
         options = vision.GestureRecognizerOptions(
             base_options=BaseOptions(model_asset_path=MODEL_PATH),
             running_mode=vision.RunningMode.VIDEO,
-            num_hands=1,
+            num_hands=2,   # 더블 클랩 트리거는 양손 랜드마크가 필요
             min_hand_detection_confidence=0.5,
             min_tracking_confidence=0.5,
         )
@@ -793,6 +884,7 @@ class GestureWatcher(threading.Thread):
         log("카메라 감시 시작")
 
         stab = GestureStabilizer()
+        clap = ClapDetector()
         prev_locked = False
         prev_stage = "shade"
         seq_index = 0             # 해제 시퀀스 진행 위치
@@ -820,8 +912,10 @@ class GestureWatcher(threading.Thread):
             gesture = "None"
             score = 0.0
             if result.gestures:
-                top = result.gestures[0][0]
-                if top.score >= MIN_CONFIDENCE:
+                # 손이 두 개면 신뢰도가 더 높은 손의 제스처를 쓴다
+                top = max((g[0] for g in result.gestures if g),
+                          key=lambda c: c.score, default=None)
+                if top is not None and top.score >= MIN_CONFIDENCE:
                     gesture = top.category_name
                     score = top.score
 
@@ -863,6 +957,11 @@ class GestureWatcher(threading.Thread):
             candidate, held = stab.update(gesture, now)
 
             if self.test_mode:
+                before = clap.claps
+                if clap.update(result.hand_landmarks, now):
+                    print("    👏👏 더블 클랩! (트리거 조건 충족)", flush=True)
+                elif clap.claps != before:
+                    print(f"    👏 클랩 {clap.claps}/2", flush=True)
                 if gesture != last_logged:
                     print(f"    인식: {GESTURE_EMOJI.get(gesture, '')} {gesture}"
                           f"  (안정화: {candidate} {held:.1f}s)", flush=True)
@@ -944,7 +1043,14 @@ class GestureWatcher(threading.Thread):
                     continue
                 if now < cooldown_until:
                     continue
-                if candidate == TRIGGER_GESTURE and held >= TRIGGER_HOLD_SEC:
+                if TRIGGER_GESTURE == "Double_Clap":
+                    before = clap.claps
+                    if clap.update(result.hand_landmarks, now):
+                        log("더블 클랩 감지 → 락다운 요청")
+                        AppHelper.callAfter(self.app.lockdown)
+                    elif clap.claps > before:
+                        log("클랩 1/2 감지")
+                elif candidate == TRIGGER_GESTURE and held >= TRIGGER_HOLD_SEC:
                     stab.consume(now)
                     log("트리거 제스처 감지 → 락다운 요청")
                     AppHelper.callAfter(self.app.lockdown)

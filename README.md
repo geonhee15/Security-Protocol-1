@@ -107,6 +107,9 @@ cd Security-Protocol-1
 ```
 
 - **사용 가능한 제스처**: `Closed_Fist` `Open_Palm` `Victory` `Pointing_Up` `Thumb_Up` `Thumb_Down` `ILoveYou`
+- **`Double_Clap`** (트리거 전용): 박수를 빠르게 두 번 치면 발동. 손 랜드마크 기반 자체 감지기로,
+  빠른 접근 속도 게이트 · 접촉 지속 상한 · 접촉→분리 완료 확인 · 0.15~1.2초 간격 창 등으로
+  오작동(천천히 손 모으기, 깍지, 스치기)을 걸러낸다. `./start.sh --test`로 감지 여부를 확인해볼 것
 - `unlock_sequence`는 원하는 길이만큼 배열로 — 길수록 안전
 - `emergency_keycode`는 macOS 가상 키코드 (예: A=0, S=1, L=37, ...), `emergency_modifiers`는 `control`/`option`/`command`/`shift` 조합
 - **비상키 조합을 누르면 락다운을 풀고 즉시 macOS 기본 잠금화면으로 전환** — 맥 비밀번호 없이는 못 들어오므로 보안이 유지된다
