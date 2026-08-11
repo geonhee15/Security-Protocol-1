@@ -756,33 +756,39 @@ class GestureStabilizer:
 class ClapDetector:
     """양손 랜드마크로 '박수 두 번'(더블 클랩) 트리거를 감지한다.
 
-    박수 1회는 **접촉 순간**에 카운트한다(빠른 접근 → 손바닥 간격이 임계
-    이하). 그래서 토니 스타크식 탁-탁!(두 번째 탁에서 즉시 발동, 사이에
-    손이 조금만 벌어져도 인식)이 된다. 오작동을 막는 장치:
+    핵심: 진짜 박수는 손이 너무 빨라 접촉 순간 모션블러 + 양손 겹침으로
+    **손 추적 자체가 끊긴다**. 그래서 접촉을 두 경로로 잡는다:
 
-    - 접근 속도 게이트: 기도 자세처럼 천천히 손을 모으는 동작은 무시
-    - 접촉 지속 상한: 접촉이 길어지면(깍지/잡기) 그 카운트를 취소
-    - 재무장 히스테리시스: 접촉(0.65)과 재무장(0.9) 임계를 분리해
-      경계 떨림으로 중복 카운트되지 않음
-    - 두 박수 간격 0.08~1.2초 창: 바운스와 뒤늦은 두 번째 박수를 구분
-    - 발동 후에는 기존 락다운 쿨다운이 재발동을 막음
+    1. 직접 접촉 — 추적이 살아있고 손바닥 간격이 임계 이하 (살살 친 박수)
+    2. **추론 접촉** — 두 손이 빠르게 접근하다가(근접 + 접근 속도) 추적이
+       갑자기 끊기면 그 순간을 박수로 추론 (세게 친 진짜 박수)
+
+    오작동 방지:
+    - 접근 속도 게이트: 천천히 손을 모으는 동작은 두 경로 모두 무시
+    - 추론 접촉은 끊기기 직전 간격이 충분히 가까웠을 때만
+    - 재무장 히스테리시스: 박수 1회 후 손이 벌어져야(0.8) 다음 카운트
+    - 직접 접촉이 길어지면(깍지/잡기) 해당 카운트 취소
+    - 두 박수 간격 0.08~1.2초 창, 발동 후엔 기존 락다운 쿨다운
     """
 
-    CONTACT_R = 0.65        # 접촉: 손바닥 중심 간 거리 < 손크기 × 0.65
-    REARM_R = 0.9           # 다음 박수로 재무장되는 최소 분리 (부분 분리면 충분)
-    RELEASE_R = 1.15        # 깍지(hold) 상태에서 빠져나오는 완전 분리
-    MIN_APPROACH = 2.2      # 접촉 직전 최소 접근 속도 (손크기/초)
-    MAX_CONTACT_SEC = 0.5   # 이보다 오래 붙어있으면 박수가 아니라 잡기
-    GAP_MIN = 0.08          # 두 접촉 사이 최소 간격 (트래킹 바운스 무시)
-    GAP_MAX = 1.2           # 두 접촉 사이 최대 간격
+    CONTACT_R = 0.65        # 직접 접촉: 손바닥 간격 < 손크기 × 0.65
+    NEAR_R = 1.5            # 추론 접촉: 끊기기 직전 간격이 이 이하였어야 함
+    REARM_R = 0.8           # 다음 박수로 재무장되는 분리 간격
+    MIN_APPROACH = 2.2      # 최소 접근 속도 (손크기/초)
+    MAX_CONTACT_SEC = 0.5   # 직접 접촉이 이보다 길면 잡기 → 카운트 취소
+    GAP_MIN = 0.08          # 두 박수 최소 간격 (바운스 무시)
+    GAP_MAX = 1.2           # 두 박수 최대 간격
 
     def __init__(self):
-        self.state = "apart"
-        self.contact_at = 0.0
-        self.last_clap_at = -10.0
+        self.armed = True
+        self.had2 = False
+        self.last_dist = None
         self.approach = 0.0
         self.prev_dist = None
         self.prev_t = None
+        self.last_clap_at = -10.0
+        self.hit_at = -10.0
+        self.hit_direct = False
         self.claps = 0
 
     @staticmethod
@@ -798,15 +804,35 @@ class ClapDetector:
         return math.hypot(hand[0].x - hand[9].x,
                           hand[0].y - hand[9].y) or 1e-3
 
+    def _hit(self, now, direct):
+        """접촉 1회 등록. 더블 클랩 완성 시 True."""
+        self.hit_at = now
+        self.hit_direct = direct
+        self.armed = False
+        gap = now - self.last_clap_at
+        self.last_clap_at = now
+        if self.claps == 1 and self.GAP_MIN <= gap <= self.GAP_MAX:
+            self.claps = 0
+            return True
+        self.claps = 1
+        return False
+
     def update(self, hands, now):
-        """매 프레임 호출. 더블 클랩이 완성된 순간(두 번째 접촉)에만 True."""
+        """매 프레임 호출. 더블 클랩이 완성된 순간에만 True."""
+        fired = False
+
         if hands is None or len(hands) < 2:
-            self.state = "apart"
-            self.prev_dist = None
-            self.approach = 0.0
+            # 빠르게 접근하던 두 손이 갑자기 사라짐 = 겹침/블러 → 박수로 추론
+            if (self.had2 and self.armed
+                    and self.last_dist is not None
+                    and self.last_dist < self.NEAR_R
+                    and self.approach > self.MIN_APPROACH):
+                fired = self._hit(now, direct=False)
+            self.had2 = False
+            self.prev_dist = None   # 접근 속도는 동결(리셋 안 함) — 재등장 대비
             if self.claps and now - self.last_clap_at > self.GAP_MAX:
                 self.claps = 0
-            return False
+            return fired
 
         (ax, ay) = self._palm(hands[0])
         (bx, by) = self._palm(hands[1])
@@ -815,32 +841,24 @@ class ClapDetector:
 
         if self.prev_dist is not None and self.prev_t is not None:
             dt = max(1e-3, now - self.prev_t)
-            speed = (self.prev_dist - dist) / dt   # +면 접근 중
-            self.approach += (speed - self.approach) * 0.5
+            inst = (self.prev_dist - dist) / dt   # +면 접근 중
+            # 빠른 어택 / 짧은 감쇠: 박수의 2~3프레임짜리 접근에도 반응
+            self.approach = max(inst, self.approach * 0.6)
         self.prev_dist = dist
         self.prev_t = now
+        self.last_dist = dist
+        self.had2 = True
 
-        fired = False
-        if self.state == "apart":
+        if self.armed:
             if dist < self.CONTACT_R and self.approach > self.MIN_APPROACH:
-                self.state = "contact"
-                self.contact_at = now
-                gap = now - self.last_clap_at
-                if self.claps == 1 and self.GAP_MIN <= gap <= self.GAP_MAX:
-                    self.claps = 0
-                    fired = True          # 탁-탁! 두 번째 접촉에서 즉시 발동
-                else:
-                    self.claps = 1        # 첫 박수 (또는 창을 벗어난 재시작)
-                self.last_clap_at = now
-        elif self.state == "contact":
-            if now - self.contact_at > self.MAX_CONTACT_SEC:
-                self.state = "hold"
-                self.claps = 0            # 잡기였음 → 방금 카운트 취소
-            elif dist > self.REARM_R:
-                self.state = "apart"      # 부분 분리면 다음 박수 준비 완료
-        elif self.state == "hold":
-            if dist > self.RELEASE_R:
-                self.state = "apart"
+                fired = self._hit(now, direct=True)
+        else:
+            if dist > self.REARM_R:
+                self.armed = True
+            elif (self.hit_direct and self.claps
+                    and dist < self.CONTACT_R
+                    and now - self.hit_at > self.MAX_CONTACT_SEC):
+                self.claps = 0   # 박수인 줄 알았는데 잡기 → 취소
 
         if self.claps == 1 and now - self.last_clap_at > self.GAP_MAX:
             self.claps = 0
