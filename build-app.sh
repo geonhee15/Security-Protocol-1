@@ -53,5 +53,8 @@ codesign --force --sign - "$APP" 2>&1 | grep -v "replacing existing signature" |
 echo "$SITE" > "$DIR/.app-pythonpath"
 
 echo "앱 번들 생성: $APP"
+echo "[!] 재서명됨 — macOS가 손쉬운 사용(Accessibility) 권한을 무효화합니다."
+echo "    시스템 설정 > 개인정보 보호 및 보안 > 손쉬운 사용에서"
+echo "    SecurityProtocol1을 제거(-) 후 다시 추가(+)해 주세요."
 echo "  실행 파일: $(basename "$SRC") → Contents/MacOS/SecurityProtocol1"
 echo "  PYTHONPATH: $SITE"
