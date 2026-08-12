@@ -40,6 +40,8 @@ cat > "$APP/Contents/Info.plist" <<EOF
     <key>LSUIElement</key><true/>
     <key>NSCameraUsageDescription</key>
     <string>제스처 인식으로 락다운을 발동하고 해제하기 위해 카메라를 사용합니다.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>더블 클랩(박수 두 번) 트리거의 음향 임펄스를 감지하기 위해 마이크를 사용합니다.</string>
 </dict>
 </plist>
 EOF

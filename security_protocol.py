@@ -753,6 +753,134 @@ class GestureStabilizer:
         self.seen = now
 
 
+class AudioClapDetector:
+    """마이크로 박수의 음향 임펄스를 감지한다 — 더블 클랩 v4의 주 신호.
+
+    비전(손 추적)은 박수 접촉 순간 모션블러·겹침으로 오히려 끊기지만,
+    소리는 정확히 그 순간 난다. 박수의 음향 특징으로 구분한다:
+
+    - 짧다: 온셋 후 ~110ms 안에 RMS가 온셋 블록의 35% 아래로 감쇠
+      (말소리·음악·환풍기 같은 지속음 차단)
+    - 광대역: 인접 샘플 차분 에너지 비율이 높음 (저역 진동·웅웅거림 차단)
+    - 크다: 적응형 소음 바닥의 8배 이상 + 절대 최소 피크
+      (키보드 타이핑·미세음 차단)
+
+    두 온셋이 0.10~1.0초 간격이면 더블 클랩. 최종 발동은 GestureWatcher가
+    "최근에 손이 보였는가"(비전 게이트)와 융합해 결정한다 — TV·문 소리
+    같은 외부 임펄스는 손이 화면에 없으면 무시된다.
+    """
+
+    SR = 16000
+    BLOCK = 256                  # 16 ms
+    PEAK_OVER_FLOOR = 8.0        # 온셋 피크 >= 소음 바닥 RMS x 배율
+    ABS_MIN_PEAK = 0.03          # 절대 최소 피크
+    HF_RATIO_MIN = 0.20          # 광대역성: 인접 차분 에너지 / 전체 에너지
+    DECAY_BLOCKS = 9             # 온셋 후 관찰 블록 수 (~144ms)
+    DECAY_RATIO = 0.35           # 꼬리 RMS < 코어 RMS x 비율이어야 임펄스
+    REFRACTORY_SEC = 0.07        # 온셋 간 최소 간격 (반향/바운스 무시)
+    GAP_MIN = 0.12               # 두 박수 최소 간격 (강한 반향 오인 방지)
+    GAP_MAX = 1.0                # 두 박수 최대 간격
+
+    def __init__(self, autostart=True):
+        self.available = False
+        self._stream = None
+        self._lock = threading.Lock()
+        self._floor = 3e-3
+        self._pending = None         # (시각, 온셋 블록 RMS) — 감쇠 확인 대기
+        self._tail = []
+        self._last_onset = -10.0
+        self._onsets = collections.deque(maxlen=8)
+        self._double_at = None
+        if autostart:
+            self.start()
+
+    def start(self):
+        try:
+            import sounddevice as sd
+            self._stream = sd.InputStream(
+                samplerate=self.SR, blocksize=self.BLOCK, channels=1,
+                dtype="float32", callback=self._on_block)
+            self._stream.start()
+            self.available = True
+            log("클랩 오디오 감지 시작 (마이크 융합 모드)")
+        except Exception as e:
+            log(f"[!] 클랩 오디오 감지 사용 불가 → 비전 단독 폴백: {e}")
+
+    def stop(self):
+        try:
+            if self._stream is not None:
+                self._stream.stop()
+                self._stream.close()
+        except Exception:
+            pass
+        self.available = False
+
+    def _on_block(self, indata, frames, t_info, status):
+        try:
+            x = indata[:, 0]
+            peak = float(np.max(np.abs(x)))
+            rms = float(np.sqrt(np.mean(x * x))) + 1e-9
+            diff = np.diff(x)
+            hf = float(np.sum(diff * diff) / (np.sum(x * x) + 1e-12))
+            with self._lock:
+                self._process(time.monotonic(), peak, rms, hf)
+        except Exception:
+            pass
+
+    def _process(self, now, peak, rms, hf):
+        """블록 하나 처리. 잠금 상태에서 호출된다 (테스트에서 직접 호출 가능)."""
+        if self._pending is not None:
+            self._tail.append(rms)
+            if len(self._tail) >= self.DECAY_BLOCKS:
+                t0, rms0 = self._pending
+                # 어택이 여러 블록에 퍼질 수 있으니 온셋+2블록 중 최대 RMS를
+                # 임펄스 '코어'로 삼고, ~80ms 이후 꼬리가 그 아래로 감쇠해야
+                # 박수로 인정한다 (지속음은 꼬리가 코어와 비슷하게 유지됨)
+                core = max([rms0] + self._tail[:2])
+                late = self._tail[4:]
+                tail_rms = sum(late) / max(1, len(late))
+                self._pending = None
+                self._tail = []
+                if tail_rms < core * self.DECAY_RATIO:
+                    self._register_onset(t0)
+            return
+        if (peak > self.ABS_MIN_PEAK
+                and peak > self._floor * self.PEAK_OVER_FLOOR
+                and hf > self.HF_RATIO_MIN
+                and now - self._last_onset > self.REFRACTORY_SEC):
+            self._pending = (now, rms)
+            self._tail = []
+        else:
+            # 조용한 블록만 바닥에 반영 — 박수가 스스로 바닥을 끌어올리지 않게
+            self._floor = max(1e-4, self._floor * 0.98 + rms * 0.02)
+
+    def _register_onset(self, t):
+        self._last_onset = t
+        for prev in reversed(self._onsets):
+            gap = t - prev
+            if self.GAP_MIN <= gap <= self.GAP_MAX:
+                self._double_at = t
+                self._onsets.clear()
+                return
+            if gap > self.GAP_MAX:
+                break
+        self._onsets.append(t)
+
+    def poll_double(self):
+        """더블 클랩이 완성됐으면 그 시각을 반환하고 소비한다."""
+        with self._lock:
+            t = self._double_at
+            self._double_at = None
+            return t
+
+    def onset_near(self, t, tol):
+        """시각 t 근처(tol초)에 오디오 온셋이 있었는가 — 비전 확인용."""
+        with self._lock:
+            if self._last_onset > 0 and abs(self._last_onset - t) <= tol:
+                return True
+            return any(abs(o - t) <= tol for o in self._onsets)
+
+
 class ClapDetector:
     """양손 랜드마크로 '박수 두 번'(더블 클랩) 트리거를 감지한다.
 
@@ -782,6 +910,7 @@ class ClapDetector:
     def __init__(self):
         self.armed = True
         self.had2 = False
+        self.last_mid = None
         self.last_dist = None
         self.approach = 0.0
         self.prev_dist = None
@@ -822,8 +951,17 @@ class ClapDetector:
         fired = False
 
         if hands is None or len(hands) < 2:
-            # 빠르게 접근하던 두 손이 갑자기 사라짐 = 겹침/블러 → 박수로 추론
-            if (self.had2 and self.armed
+            # 빠르게 접근하던 두 손이 갑자기 사라짐 = 겹침/블러 → 박수로 추론.
+            # 단, 한 손이 남아 있으면 그 손이 직전 두 손의 중간점 근처(겹침
+            # 블롭)여야 한다 — 한 손이 그냥 프레임을 벗어난 경우(타이핑,
+            # 물건 집기)를 박수로 오인하지 않기 위한 v4 게이트.
+            merged = True
+            if hands and len(hands) == 1 and self.last_mid is not None:
+                px, py = self._palm(hands[0])
+                ref1 = self._size(hands[0])
+                merged = math.hypot(px - self.last_mid[0],
+                                    py - self.last_mid[1]) / ref1 < 1.6
+            if (merged and self.had2 and self.armed
                     and self.last_dist is not None
                     and self.last_dist < self.NEAR_R
                     and self.approach > self.MIN_APPROACH):
@@ -847,6 +985,7 @@ class ClapDetector:
         self.prev_dist = dist
         self.prev_t = now
         self.last_dist = dist
+        self.last_mid = ((ax + bx) / 2.0, (ay + by) / 2.0)
         self.had2 = True
 
         if self.armed:
@@ -905,6 +1044,11 @@ class GestureWatcher(threading.Thread):
 
         stab = GestureStabilizer()
         clap = ClapDetector()
+        audio = None
+        if TRIGGER_GESTURE == "Double_Clap" and CONFIG.get("clap_audio", True):
+            audio = AudioClapDetector()
+        hands_seen_at = -1e9      # 오디오 발동 게이트: 최근에 손이 보였는가
+        HANDS_RECENT_SEC = 3.0
         prev_locked = False
         prev_stage = "shade"
         seq_index = 0             # 해제 시퀀스 진행 위치
@@ -946,6 +1090,11 @@ class GestureWatcher(threading.Thread):
                 fps = fps * 0.9 + (1.0 / dt) * 0.1
             locked = self.app.locked
 
+            if result.hand_landmarks:
+                hands_seen_at = now
+            # 매 프레임 소비 — 쿨다운/락 중에 쌓인 이벤트가 뒤늦게 터지지 않게
+            audio_double = audio.poll_double() if (audio and audio.available) else None
+
             # macOS 잠금화면 상태 (0.5초 스로틀) — 탭 콜백과 공유
             if now - screen_checked_at > 0.5:
                 screen_checked_at = now
@@ -979,9 +1128,16 @@ class GestureWatcher(threading.Thread):
             if self.test_mode:
                 before = clap.claps
                 if clap.update(result.hand_landmarks, now):
-                    print("    👏👏 더블 클랩! (트리거 조건 충족)", flush=True)
+                    hint = ("+오디오 확인" if audio and audio.available
+                            and audio.onset_near(now, 0.6) else "무음 — 실전에선 무시")
+                    print(f"    👏👏 비전 더블 클랩 ({hint})", flush=True)
                 elif clap.claps != before:
                     print(f"    👏 클랩 {clap.claps}/2", flush=True)
+                if audio_double is not None:
+                    gate = now - hands_seen_at < HANDS_RECENT_SEC
+                    print("    🔊 오디오 더블 클랩 "
+                          + ("+ 손 확인 → 발동 조건 충족!" if gate
+                             else "(최근 손 미검출 → 무시)"), flush=True)
                 if gesture != last_logged:
                     print(f"    인식: {GESTURE_EMOJI.get(gesture, '')} {gesture}"
                           f"  (안정화: {candidate} {held:.1f}s)", flush=True)
@@ -1065,8 +1221,25 @@ class GestureWatcher(threading.Thread):
                     continue
                 if TRIGGER_GESTURE == "Double_Clap":
                     before = clap.claps
-                    if clap.update(result.hand_landmarks, now):
-                        log("더블 클랩 감지 → 락다운 요청")
+                    vis_fired = clap.update(result.hand_landmarks, now)
+                    fired = None   # 발동 경로 설명
+                    if audio is not None and audio.available:
+                        # 주 경로: 오디오 더블 클랩 + 최근 손 확인
+                        if audio_double is not None:
+                            if now - hands_seen_at < HANDS_RECENT_SEC:
+                                fired = "오디오+손 확인"
+                            else:
+                                log("오디오 더블 클랩 무시 (최근 손 미검출 — 외부 소음)")
+                        # 보조 경로: 비전 더블 클랩은 소리가 함께 났을 때만
+                        if fired is None and vis_fired:
+                            if audio.onset_near(now, 0.6):
+                                fired = "비전+오디오 확인"
+                            else:
+                                log("비전 더블 클랩 무시 (무음 — 오작동 방지)")
+                    elif vis_fired:
+                        fired = "비전 단독(오디오 폴백)"
+                    if fired:
+                        log(f"더블 클랩 감지({fired}) → 락다운 요청")
                         AppHelper.callAfter(self.app.lockdown)
                     elif clap.claps > before:
                         log("클랩 1/2 감지")
@@ -1076,6 +1249,8 @@ class GestureWatcher(threading.Thread):
                     AppHelper.callAfter(self.app.lockdown)
 
         cap.release()
+        if audio is not None:
+            audio.stop()
 
     def _capture_intruder(self, frame, reason, now):
         """침입 시도 순간의 카메라 스냅샷을 저장하고 폰으로 전송."""
@@ -1642,7 +1817,10 @@ def main():
         log("Security-Protocol-1 가동")
         trig = GESTURE_EMOJI.get(TRIGGER_GESTURE, TRIGGER_GESTURE)
         seq = " → ".join(GESTURE_EMOJI.get(g, g) for g in UNLOCK_SEQUENCE)
-        log(f"  트리거: {trig} {TRIGGER_HOLD_SEC}초 유지 / 해제: {seq}")
+        if TRIGGER_GESTURE == "Double_Clap":
+            log(f"  트리거: {trig}{trig} 박수 두 번 (오디오+비전 융합) / 해제: {seq}")
+        else:
+            log(f"  트리거: {trig} {TRIGGER_HOLD_SEC}초 유지 / 해제: {seq}")
         log("  비상키: 설정된 조합 → macOS 잠금화면")
         if CONFIG_SRC != "config.local.json":
             log("[!] config.local.json 없음 — 예시 설정으로 동작 중. "

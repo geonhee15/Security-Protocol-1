@@ -1,11 +1,19 @@
 {
   "trigger_gesture": "Thumb_Down",
   "trigger_hold_sec": 1.5,
-  "unlock_sequence": ["Thumb_Up", "ILoveYou", "Thumb_Up"],
+  "unlock_sequence": [
+    "Thumb_Up",
+    "ILoveYou",
+    "Thumb_Up"
+  ],
   "step_hold_sec": 0.8,
   "max_unlock_attempts": 5,
   "emergency_keycode": 37,
-  "emergency_modifiers": ["control", "option", "command"],
+  "emergency_modifiers": [
+    "control",
+    "option",
+    "command"
+  ],
   "notify": {
     "provider": "none",
     "ntfy_topic": "",
@@ -17,5 +25,6 @@
     "ntfy_command_topic": "",
     "token": "",
     "allow_unlock": true
-  }
+  },
+  "clap_audio": true
 }
