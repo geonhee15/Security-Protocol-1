@@ -92,6 +92,9 @@ MAX_UNLOCK_ATTEMPTS = int(CONFIG.get("max_unlock_attempts", 5))
 LOCK_FILE = os.path.join(BASE_DIR, ".security_protocol.lock")
 TRIGGER_GESTURE = CONFIG.get("trigger_gesture", "Thumb_Down")
 TRIGGER_HOLD_SEC = float(CONFIG.get("trigger_hold_sec", 1.5))
+# 더블 클랩 v5 — 키보드 타건음 오발동 방지 게이트
+CLAP_REQUIRE_VISION = bool(CONFIG.get("clap_require_vision", True))   # 손 접촉 확인 필수
+CLAP_VISION_TOL_SEC = float(CONFIG.get("clap_vision_tol_sec", 1.5))    # 접촉 ↔ 소리 허용 시차
 UNLOCK_SEQUENCE = list(CONFIG.get("unlock_sequence",
                                   ["Thumb_Up", "ILoveYou", "Thumb_Up"]))
 STEP_HOLD_SEC = float(CONFIG.get("step_hold_sec", 0.8))
@@ -762,18 +765,23 @@ class AudioClapDetector:
     - 짧다: 온셋 후 ~110ms 안에 RMS가 온셋 블록의 35% 아래로 감쇠
       (말소리·음악·환풍기 같은 지속음 차단)
     - 광대역: 인접 샘플 차분 에너지 비율이 높음 (저역 진동·웅웅거림 차단)
-    - 크다: 적응형 소음 바닥의 8배 이상 + 절대 최소 피크
-      (키보드 타이핑·미세음 차단)
+    - 크다: 적응형 소음 바닥의 12배 이상 + 절대 최소 피크 0.10
+      (키보드 타이핑·미세음 차단 — v5에서 상향)
+    - 고립돼 있다 (v5): 두 온셋 앞 0.6초와 뒤 0.35초에 다른 온셋이 없어야
+      한다. 타이핑은 임펄스가 연달아 오므로 여기서 걸러진다.
 
-    두 온셋이 0.10~1.0초 간격이면 더블 클랩. 최종 발동은 GestureWatcher가
-    "최근에 손이 보였는가"(비전 게이트)와 융합해 결정한다 — TV·문 소리
-    같은 외부 임펄스는 손이 화면에 없으면 무시된다.
+    두 온셋이 0.12~1.0초 간격이면 더블 클랩 후보 → 고립 확인 후 확정.
+    최종 발동은 GestureWatcher가 "최근에 손이 보였고 실제로 모였는가"
+    (비전 접촉 게이트)와 융합해 결정한다 — TV·문 소리·키보드는 손이
+    모이지 않으므로 무시된다.
     """
 
     SR = 16000
     BLOCK = 256                  # 16 ms
-    PEAK_OVER_FLOOR = 8.0        # 온셋 피크 >= 소음 바닥 RMS x 배율
-    ABS_MIN_PEAK = 0.03          # 절대 최소 피크
+    PEAK_OVER_FLOOR = 12.0       # 온셋 피크 >= 소음 바닥 RMS x 배율 (config clap_peak_over_floor)
+    ABS_MIN_PEAK = 0.10          # 절대 최소 피크 (config clap_min_peak)
+    ISOLATION_SEC = 0.5          # 둘째 박수 뒤 이 시간 동안 추가 온셋 없어야 확정
+    PRE_QUIET_SEC = 0.6          # 첫째 박수 앞 이 시간 동안 다른 온셋 없어야 함
     HF_RATIO_MIN = 0.20          # 광대역성: 인접 차분 에너지 / 전체 에너지
     DECAY_BLOCKS = 9             # 온셋 후 관찰 블록 수 (~144ms)
     DECAY_RATIO = 0.35           # 꼬리 RMS < 코어 RMS x 비율이어야 임펄스
@@ -791,6 +799,10 @@ class AudioClapDetector:
         self._last_onset = -10.0
         self._onsets = collections.deque(maxlen=8)
         self._double_at = None
+        self._cand = None            # (첫째, 둘째) 더블 클랩 후보 — 고립 확인 대기
+        self.ABS_MIN_PEAK = float(CONFIG.get("clap_min_peak", self.ABS_MIN_PEAK))
+        self.PEAK_OVER_FLOOR = float(CONFIG.get("clap_peak_over_floor", self.PEAK_OVER_FLOOR))
+        self.ISOLATION_SEC = float(CONFIG.get("clap_isolation_sec", self.ISOLATION_SEC))
         if autostart:
             self.start()
 
@@ -856,22 +868,34 @@ class AudioClapDetector:
 
     def _register_onset(self, t):
         self._last_onset = t
-        for prev in reversed(self._onsets):
-            gap = t - prev
+        if self._cand is not None:
+            # 후보 확정 전에 세 번째 임펄스 → 타이핑/연타 → 후보 취소
+            self._cand = None
+        prevs = [p for p in self._onsets if 0 < t - p <= self.GAP_MAX + self.PRE_QUIET_SEC]
+        if prevs:
+            t1 = prevs[-1]
+            gap = t - t1
             if self.GAP_MIN <= gap <= self.GAP_MAX:
-                self._double_at = t
-                self._onsets.clear()
-                return
-            if gap > self.GAP_MAX:
-                break
+                # 첫째 박수 직전(PRE_QUIET_SEC)에 다른 온셋이 있었으면 연타로 거부
+                if any(0 < t1 - p < self.PRE_QUIET_SEC for p in prevs[:-1]):
+                    self._onsets.append(t)
+                    return
+                self._cand = (t1, t)
         self._onsets.append(t)
 
     def poll_double(self):
-        """더블 클랩이 완성됐으면 그 시각을 반환하고 소비한다."""
+        """더블 클랩이 확정됐으면 둘째 박수 시각을 반환하고 소비한다.
+        후보는 둘째 박수 뒤 ISOLATION_SEC 동안 추가 온셋이 없을 때만 확정."""
         with self._lock:
-            t = self._double_at
-            self._double_at = None
-            return t
+            if self._cand is None:
+                return None
+            t1, t2 = self._cand
+            # 판정 대기 중인 온셋(_pending)이 있으면 그 결과를 보고 결정
+            if self._pending is not None or time.monotonic() - t2 < self.ISOLATION_SEC:
+                return None
+            self._cand = None
+            self._onsets.clear()
+            return t2
 
     def onset_near(self, t, tol):
         """시각 t 근처(tol초)에 오디오 온셋이 있었는가 — 비전 확인용."""
@@ -906,8 +930,10 @@ class ClapDetector:
     MAX_CONTACT_SEC = 0.5   # 직접 접촉이 이보다 길면 잡기 → 카운트 취소
     GAP_MIN = 0.08          # 두 박수 최소 간격 (바운스 무시)
     GAP_MAX = 1.2           # 두 박수 최대 간격
+    CLOSE_R = 1.0           # v5: 두 손이 이 이하로 모인 순간을 기록 (오디오 융합 게이트)
 
     def __init__(self):
+        self.last_close_at = -10.0
         self.armed = True
         self.had2 = False
         self.last_mid = None
@@ -945,6 +971,11 @@ class ClapDetector:
             return True
         self.claps = 1
         return False
+
+    def recent_contact(self, now, tol):
+        """최근 tol초 안에 박수 접촉(직접/추론)이나 두 손 근접이 있었는가.
+        오디오 더블 클랩의 비전 게이트 — 타이핑은 두 손이 떨어져 있어 실패."""
+        return (now - self.last_clap_at <= tol) or (now - self.last_close_at <= tol)
 
     def update(self, hands, now):
         """매 프레임 호출. 더블 클랩이 완성된 순간에만 True."""
@@ -987,6 +1018,8 @@ class ClapDetector:
         self.last_dist = dist
         self.last_mid = ((ax + bx) / 2.0, (ay + by) / 2.0)
         self.had2 = True
+        if dist < self.CLOSE_R:
+            self.last_close_at = now
 
         if self.armed:
             if dist < self.CONTACT_R and self.approach > self.MIN_APPROACH:
@@ -1134,10 +1167,15 @@ class GestureWatcher(threading.Thread):
                 elif clap.claps != before:
                     print(f"    👏 클랩 {clap.claps}/2", flush=True)
                 if audio_double is not None:
-                    gate = now - hands_seen_at < HANDS_RECENT_SEC
-                    print("    🔊 오디오 더블 클랩 "
-                          + ("+ 손 확인 → 발동 조건 충족!" if gate
-                             else "(최근 손 미검출 → 무시)"), flush=True)
+                    seen = now - hands_seen_at < HANDS_RECENT_SEC
+                    contact = clap.recent_contact(now, CLAP_VISION_TOL_SEC)
+                    if not seen:
+                        verdict = "(최근 손 미검출 → 무시)"
+                    elif CLAP_REQUIRE_VISION and not contact:
+                        verdict = "(손은 보이지만 모이지 않음 → 무시: 키보드/타건음)"
+                    else:
+                        verdict = "+ 손 접촉 확인 → 발동 조건 충족!"
+                    print(f"    🔊 오디오 더블 클랩 {verdict}", flush=True)
                 if gesture != last_logged:
                     print(f"    인식: {GESTURE_EMOJI.get(gesture, '')} {gesture}"
                           f"  (안정화: {candidate} {held:.1f}s)", flush=True)
@@ -1226,10 +1264,14 @@ class GestureWatcher(threading.Thread):
                     if audio is not None and audio.available:
                         # 주 경로: 오디오 더블 클랩 + 최근 손 확인
                         if audio_double is not None:
-                            if now - hands_seen_at < HANDS_RECENT_SEC:
-                                fired = "오디오+손 확인"
-                            else:
+                            if now - hands_seen_at >= HANDS_RECENT_SEC:
                                 log("오디오 더블 클랩 무시 (최근 손 미검출 — 외부 소음)")
+                            elif (CLAP_REQUIRE_VISION
+                                    and not clap.recent_contact(now, CLAP_VISION_TOL_SEC)):
+                                log("오디오 더블 클랩 무시 (두 손이 모이지 않음 — "
+                                    "키보드/타건음 추정)")
+                            else:
+                                fired = "오디오+손 접촉 확인"
                         # 보조 경로: 비전 더블 클랩은 소리가 함께 났을 때만
                         if fired is None and vis_fired:
                             if audio.onset_near(now, 0.6):
