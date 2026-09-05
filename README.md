@@ -122,6 +122,7 @@ cd Security-Protocol-1
   오작동을 원천 차단. 한 손만 사라진 경우(타이핑·물건 집기)도 겹침 블롭 위치 검사로
   걸러낸다. 마이크를 못 열면 자동으로 비전 단독 폴백. `clap_audio: false`로 오디오 융합을
   끌 수 있다. `./start.sh --test`로 감지 여부를 확인해볼 것 (발동 경로가 로그에 표시됨)
+- **옴니 제스처 브리지** (`omni_gestures`, 기본 true): 카메라 손 포즈를 UDP 127.0.0.1:47832(`omni_gesture_port`)로 Omni OS에 보낸다 — SMART CONTROL 패널이 "손가락 총 → 조명 토글"처럼 매핑해 스마트 기기를 조종. 커스텀 포즈 **Finger_Gun**(검지 펴고 엄지를 세운 L자, 나머지 접음)은 MediaPipe 기본 제스처에 없어 21개 랜드마크 기하로 판정하고, 그 외엔 기본 제스처(Thumb_Up·Open_Palm·Closed_Fist·Victory·Pointing_Up·ILoveYou)를 그대로 보낸다. 포즈를 `omni_gesture_hold_sec`(0.5초) 유지하면 한 번 발동, 손을 풀어야 재발동, `omni_gesture_cooldown_sec`(2.5초) 쿨다운. 락다운 중과 트리거 제스처(Thumb_Down)는 보내지 않는다. `--test` 모드에서는 "→ 옴니 제스처 발동"으로 출력
 - **얼굴 텔레메트리** (`face_telemetry`, 기본 true): 카메라 프레임에서 MediaPipe FaceLandmarker로 입 벌림(jawOpen)·얼굴 수·정면 여부를 계산해 UDP 127.0.0.1:47831로 30Hz 송출 — Omni OS 상시 대기의 "화면 앞 사람이 지금 말하는가" 신호(카메라 권한·경합 없이 공유). `models/face_landmarker.task` 필요
 - `unlock_sequence`는 원하는 길이만큼 배열로 — 길수록 안전
 - `emergency_keycode`는 macOS 가상 키코드 (예: A=0, S=1, L=37, ...), `emergency_modifiers`는 `control`/`option`/`command`/`shift` 조합

@@ -95,6 +95,12 @@ TRIGGER_GESTURE = CONFIG.get("trigger_gesture", "Thumb_Down")
 TRIGGER_HOLD_SEC = float(CONFIG.get("trigger_hold_sec", 1.5))
 # 더블 클랩 v5 — 키보드 타건음 오발동 방지 게이트
 CLAP_REQUIRE_VISION = bool(CONFIG.get("clap_require_vision", True))   # 타이핑 자세면 거부
+# 옴니 제스처 브리지 — 손 포즈(커스텀 Finger_Gun + MediaPipe 기본 제스처)를 UDP 127.0.0.1:47832로
+# Omni OS에 흘린다 (SMART CONTROL: 손가락 총 → 조명 토글 등). 락다운 중·트리거 제스처는 제외.
+OMNI_GESTURES = bool(CONFIG.get("omni_gestures", True))
+OMNI_GESTURE_HOLD = float(CONFIG.get("omni_gesture_hold_sec", 0.5))
+OMNI_GESTURE_COOLDOWN = float(CONFIG.get("omni_gesture_cooldown_sec", 2.5))
+OMNI_GESTURE_PORT = int(CONFIG.get("omni_gesture_port", 47832))
 UNLOCK_SEQUENCE = list(CONFIG.get("unlock_sequence",
                                   ["Thumb_Up", "ILoveYou", "Thumb_Up"]))
 STEP_HOLD_SEC = float(CONFIG.get("step_hold_sec", 0.8))
@@ -719,6 +725,62 @@ class HUDRenderer:
 
 
 # ──────────────────────────── 제스처 안정화 ────────────────────────────
+def _lm_xy(lm, aspect=4.0 / 3.0):
+    """정규화 랜드마크 → 화면 비율을 반영한 (x, y) (각도·거리 왜곡 방지)."""
+    return (lm.x * aspect, lm.y)
+
+
+def _pt_dist(a, b):
+    return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
+def _pt_angle(a, b, c):
+    """b를 꼭짓점으로 하는 각(도)."""
+    v1 = (a[0] - b[0], a[1] - b[1])
+    v2 = (c[0] - b[0], c[1] - b[1])
+    n1, n2 = math.hypot(*v1), math.hypot(*v2)
+    if n1 < 1e-9 or n2 < 1e-9:
+        return 0.0
+    cosv = max(-1.0, min(1.0, (v1[0] * v2[0] + v1[1] * v2[1]) / (n1 * n2)))
+    return math.degrees(math.acos(cosv))
+
+
+def detect_custom_pose(hand):
+    """21개 손 랜드마크 → 옴니 제어용 커스텀 포즈 이름 또는 None.
+
+    Finger_Gun (손가락 총 / L자): 검지 곧게 펴짐 + 엄지 펴져서 검지와 45~135° +
+    중지·약지·새끼 접힘. MediaPipe 기본 제스처 집합에는 없어서 기하로 판정한다.
+    """
+    if not hand or len(hand) < 21:
+        return None
+    p = [_lm_xy(l) for l in hand]
+    wrist = p[0]
+    size = _pt_dist(p[0], p[9]) or 1e-6           # 손바닥 크기 (손목 → 중지 MCP)
+
+    def extended(mcp, pip, tip):
+        return (_pt_angle(p[mcp], p[pip], p[tip]) > 150
+                and _pt_dist(wrist, p[tip]) > _pt_dist(wrist, p[pip]) * 1.15)
+
+    def curled(mcp, pip, tip):
+        return (_pt_dist(wrist, p[tip]) < _pt_dist(wrist, p[pip]) * 1.05
+                or _pt_angle(p[mcp], p[pip], p[tip]) < 120)
+
+    index_out = extended(5, 6, 8)
+    others_in = curled(9, 10, 12) and curled(13, 14, 16) and curled(17, 18, 20)
+    thumb_out = (_pt_angle(p[2], p[3], p[4]) > 140                   # 엄지 곧게
+                 and _pt_angle(p[1], p[2], p[4]) > 120                 # 손바닥 안으로 접히지 않음
+                 and _pt_dist(p[4], p[17]) > _pt_dist(p[3], p[17])     # 끝이 새끼 쪽에서 멀어짐 (접으면 반대)
+                 and _pt_dist(p[4], p[9]) > _pt_dist(p[3], p[9]))      # 손바닥 밖으로 뻗음
+    if index_out and others_in and thumb_out:
+        thumb_dir = (p[4][0] - p[2][0], p[4][1] - p[2][1])
+        index_dir = (p[8][0] - p[5][0], p[8][1] - p[5][1])
+        ang = _pt_angle((p[2][0] + thumb_dir[0], p[2][1] + thumb_dir[1]), p[2],
+                        (p[2][0] + index_dir[0], p[2][1] + index_dir[1]))
+        if 40 <= ang <= 140:
+            return "Finger_Gun"
+    return None
+
+
 class GestureStabilizer:
     """프레임 단위로 인식이 깜빡여도(잠깐 None) 제스처 유지 시간을 안정적으로 잰다.
 
@@ -1104,6 +1166,13 @@ class GestureWatcher(threading.Thread):
 
         stab = GestureStabilizer()
         clap = ClapDetector()
+        # 옴니 제스처 브리지 상태
+        omni_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) if OMNI_GESTURES else None
+        omni_stab = GestureStabilizer()
+        omni_armed = True             # 같은 포즈를 계속 들고 있으면 한 번만 발동 (풀었다가 다시)
+        omni_fired_at = -1e9
+        if omni_sock is not None:
+            log(f"옴니 제스처 브리지 시작 (UDP {OMNI_GESTURE_PORT}, 유지 {OMNI_GESTURE_HOLD}s)")
         audio = None
         if TRIGGER_GESTURE == "Double_Clap" and CONFIG.get("clap_audio", True):
             audio = AudioClapDetector()
@@ -1202,6 +1271,38 @@ class GestureWatcher(threading.Thread):
                     self.hud.fail_count = 0
 
             candidate, held = stab.update(gesture, now)
+
+            # ---- 옴니 제스처 브리지: 커스텀 포즈(Finger_Gun) 우선, 없으면 기본 제스처.
+            # 락다운 중·트리거 제스처는 보내지 않는다. 포즈를 유지 시간만큼 들면 한 번 발동,
+            # 손을 풀어야 다시 발동 (연속 발동 방지) + 쿨다운.
+            if omni_sock is not None and not locked:
+                og = "None"
+                if result.hand_landmarks:
+                    for hl in result.hand_landmarks:
+                        pose = detect_custom_pose(hl)
+                        if pose:
+                            og = pose
+                            break
+                if og == "None" and gesture not in ("None", TRIGGER_GESTURE):
+                    og = gesture
+                ocand, oheld = omni_stab.update(og, now)
+                if ocand == "None":
+                    omni_armed = True
+                elif (omni_armed and oheld >= OMNI_GESTURE_HOLD
+                      and now - omni_fired_at >= OMNI_GESTURE_COOLDOWN
+                      and now >= cooldown_until):
+                    omni_armed = False
+                    omni_fired_at = now
+                    try:
+                        omni_sock.sendto(json.dumps({"t": time.time(), "gesture": ocand,
+                                                     "held": round(oheld, 2), "source": "sp1"}).encode(),
+                                         ("127.0.0.1", OMNI_GESTURE_PORT))
+                    except OSError:
+                        pass
+                    if self.test_mode:
+                        print(f"    → 옴니 제스처 발동: {ocand} ({oheld:.1f}s)", flush=True)
+                    else:
+                        log(f"옴니 제스처 → {ocand} ({oheld:.1f}s)")
 
             if self.test_mode:
                 before = clap.claps
