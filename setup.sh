@@ -12,9 +12,13 @@ echo "[2/4] 의존성 설치"
 echo "[3/4] 제스처 인식 모델 다운로드 (~8MB)"
 mkdir -p models
 if [ ! -f models/gesture_recognizer.task ]; then
-if [ ! -f models/face_landmarker.task ]; then
   curl -sL -o models/gesture_recognizer.task \
     "https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task"
+fi
+if [ ! -f models/face_landmarker.task ]; then
+  # 얼굴 텔레메트리(옴니 음성 게이트용) — 없으면 그 기능만 꺼진다
+  curl -sL -o models/face_landmarker.task \
+    "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
 fi
 
 echo "[4/4] 로컬 설정 생성"
