@@ -28,7 +28,6 @@
   },
   "clap_audio": true,
   "clap_require_vision": true,
-  "clap_vision_tol_sec": 1.5,
   "clap_min_peak": 0.10,
   "clap_peak_over_floor": 12,
   "clap_isolation_sec": 0.5
