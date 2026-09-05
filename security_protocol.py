@@ -33,6 +33,7 @@ import os
 import random
 import subprocess
 import sys
+import socket
 import threading
 import time
 import traceback
@@ -1074,6 +1075,26 @@ class GestureWatcher(threading.Thread):
         )
         recognizer = vision.GestureRecognizer.create_from_options(options)
 
+        # ---- 얼굴 텔레메트리 (옴니 음성 게이트용): 입 벌림(jawOpen)·얼굴 수·정면 여부를
+        # UDP 127.0.0.1:47831 로 흘린다. 카메라를 이미 쥔 SP-1이 계산해 주면 옴니 쪽은
+        # 카메라 권한/경합 없이 "화면 앞 사람이 지금 말하는가"를 알 수 있다.
+        face_lm = None
+        face_sock = None
+        if CONFIG.get("face_telemetry", True):
+            try:
+                fopts = vision.FaceLandmarkerOptions(
+                    base_options=BaseOptions(model_asset_path=os.path.join(
+                        os.path.dirname(os.path.abspath(__file__)), "models", "face_landmarker.task")),
+                    running_mode=vision.RunningMode.VIDEO, num_faces=2,
+                    output_face_blendshapes=True,
+                    min_face_detection_confidence=0.5, min_tracking_confidence=0.5)
+                face_lm = vision.FaceLandmarker.create_from_options(fopts)
+                face_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                log("얼굴 텔레메트리 시작 (옴니 음성 게이트 → UDP 47831)")
+            except Exception as e:  # noqa: BLE001 — 없어도 감시는 계속
+                log(f"[!] 얼굴 텔레메트리 사용 불가: {e}")
+                face_lm = None
+
         cap = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
@@ -1111,6 +1132,24 @@ class GestureWatcher(threading.Thread):
             image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
             ts_ms = int((time.monotonic() - t0) * 1000)
             result = recognizer.recognize_for_video(image, ts_ms)
+            if face_lm is not None and frame_i % 2 == 0:
+                try:
+                    fr = face_lm.detect_for_video(image, ts_ms)
+                    faces = len(fr.face_landmarks)
+                    mouth, frontal = 0.0, False
+                    if faces:
+                        bs = fr.face_blendshapes[0] if fr.face_blendshapes else []
+                        mouth = next((c.score for c in bs if c.category_name == "jawOpen"), 0.0)
+                        lm = fr.face_landmarks[0]
+                        # 정면: 코끝이 양눈 바깥 모서리 중앙에서 눈 간격의 25% 안
+                        eye_l, eye_r, nose = lm[33], lm[263], lm[1]
+                        span = abs(eye_r.x - eye_l.x) or 1e-3
+                        frontal = abs(nose.x - (eye_l.x + eye_r.x) / 2) / span < 0.25
+                    face_sock.sendto(json.dumps({"t": time.time(), "mouth": round(float(mouth), 4),
+                                                 "faces": faces, "frontal": bool(frontal)}).encode(),
+                                     ("127.0.0.1", 47831))
+                except Exception:  # noqa: BLE001 — 텔레메트리는 감시에 영향 주지 않음
+                    pass
 
             gesture = "None"
             score = 0.0

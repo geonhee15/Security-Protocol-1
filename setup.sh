@@ -12,6 +12,7 @@ echo "[2/4] 의존성 설치"
 echo "[3/4] 제스처 인식 모델 다운로드 (~8MB)"
 mkdir -p models
 if [ ! -f models/gesture_recognizer.task ]; then
+if [ ! -f models/face_landmarker.task ]; then
   curl -sL -o models/gesture_recognizer.task \
     "https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task"
 fi

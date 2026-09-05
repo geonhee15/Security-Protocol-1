@@ -27,6 +27,7 @@
     "allow_unlock": true
   },
   "clap_audio": true,
+  "face_telemetry": true,
   "clap_require_vision": true,
   "clap_min_peak": 0.10,
   "clap_peak_over_floor": 12,

@@ -122,6 +122,7 @@ cd Security-Protocol-1
   오작동을 원천 차단. 한 손만 사라진 경우(타이핑·물건 집기)도 겹침 블롭 위치 검사로
   걸러낸다. 마이크를 못 열면 자동으로 비전 단독 폴백. `clap_audio: false`로 오디오 융합을
   끌 수 있다. `./start.sh --test`로 감지 여부를 확인해볼 것 (발동 경로가 로그에 표시됨)
+- **얼굴 텔레메트리** (`face_telemetry`, 기본 true): 카메라 프레임에서 MediaPipe FaceLandmarker로 입 벌림(jawOpen)·얼굴 수·정면 여부를 계산해 UDP 127.0.0.1:47831로 30Hz 송출 — Omni OS 상시 대기의 "화면 앞 사람이 지금 말하는가" 신호(카메라 권한·경합 없이 공유). `models/face_landmarker.task` 필요
 - `unlock_sequence`는 원하는 길이만큼 배열로 — 길수록 안전
 - `emergency_keycode`는 macOS 가상 키코드 (예: A=0, S=1, L=37, ...), `emergency_modifiers`는 `control`/`option`/`command`/`shift` 조합
 - **비상키 조합을 누르면 락다운을 풀고 즉시 macOS 기본 잠금화면으로 전환** — 맥 비밀번호 없이는 못 들어오므로 보안이 유지된다
