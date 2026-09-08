@@ -156,6 +156,17 @@ cd Security-Protocol-1
 
 `~/Library/LaunchAgents/com.<이름>.security-protocol-1.plist`를 만들어 `ProgramArguments`에 `<프로젝트경로>/venv/bin/python`과 `<프로젝트경로>/security_protocol.py`를 넣고 `RunAtLoad`/`KeepAlive`를 true로 설정한 뒤 `launchctl load` 하면 된다. launchd로 실행하면 python 바이너리 자체에 카메라/손쉬운 사용 권한을 부여해야 할 수 있다.
 
+## 학교·시험 모드 (카메라가 켜지면 안 되는 곳에서)
+
+맥의 카메라 표시등은 하드웨어라 카메라를 쓰는 한 반드시 켜진다. 그래서 SP-1은 **카메라를 켜면 안 되는 상황을 스스로 판단해 카메라와 마이크를 완전히 놓는다**(프로세스는 살아 있되 표시등·마이크 점 없음).
+
+- **집 네트워크에서만 카메라 사용** (`home_only`, 기본 true): 20초마다 기본 게이트웨이(공유기)의 MAC을 확인해 `home_gateway_macs`에 없으면 "집 밖"으로 보고 카메라·마이크를 끈다. 학교 와이파이·핫스팟·네트워크 없음은 전부 집 밖. 집에 돌아오면 자동 재개. MAC은 집에서 `route -n get default`로 게이트웨이를 찾고 `arp -n <IP>`로 확인해 적는다.
+- **메뉴 막대 아이콘 `SP1 ●/○`**: 카메라 켜짐(●)/정지(○)를 항상 표시. 메뉴에서 1시간·4시간·오늘 종일 일시정지, 다시 켜기, "집 네트워크에서만" 토글, 로그, 종료. 선생님·IT 담당자에게 보여 주면 **삭제 대신 여기서 끄면 된다**.
+- **단축키 ctrl+option+command+P**: 4시간 일시정지 ↔ 재개.
+- **시간표** (`quiet_hours`, 선택): `[{"days":[0,1,2,3,4],"from":"08:00","to":"16:00"}]`처럼 적으면 그 시간엔 무조건 정지.
+- **옴니와 공유**: 정지 상태는 `~/.omni/store/quiet_mode.json`, 집 여부는 `~/.omni/store/presence.json`으로 Omni OS와 주고받는다 — 옴니의 SCHOOL MODE를 켜거나 집 밖이면 옴니도 상시 대기(마이크)·화면 관찰을 멈추고, SP-1 메뉴에서 정지하면 옴니도 함께 조용해진다.
+- 폰 원격 명령 `pause` / `resume`도 된다. 락다운 중에는 정지되지 않는다(해제 제스처를 봐야 하므로).
+
 ## 복원·재설치 메모
 
 - `./setup.sh` → `./install-autostart.sh` 순서면 venv·모델·앱 번들·LaunchAgent가 전부 다시 만들어진다. `config.local.json`은 저장소에 없으니(gitignore) 트리거·해제 시퀀스·알림 설정은 다시 적어야 한다.

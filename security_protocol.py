@@ -31,6 +31,7 @@ import json
 import math
 import os
 import random
+import re
 import subprocess
 import sys
 import socket
@@ -101,6 +102,18 @@ OMNI_GESTURES = bool(CONFIG.get("omni_gestures", True))
 OMNI_GESTURE_HOLD = float(CONFIG.get("omni_gesture_hold_sec", 0.5))
 OMNI_GESTURE_COOLDOWN = float(CONFIG.get("omni_gesture_cooldown_sec", 2.5))
 OMNI_GESTURE_PORT = int(CONFIG.get("omni_gesture_port", 47832))
+# 학교/시험 모드 — 카메라를 켜면 안 되는 상황(집 밖·수업 시간·수동 정지·옴니 학교 모드)을
+# 스스로 판단해 카메라와 마이크를 완전히 놓는다. 카메라 표시등이 켜질 일 자체를 없앤다.
+HOME_ONLY = bool(CONFIG.get("home_only", True))
+HOME_GATEWAY_MACS = [":".join(p.zfill(2) for p in str(m).lower().split(":"))
+                     for m in CONFIG.get("home_gateway_macs", [])]
+QUIET_HOURS = CONFIG.get("quiet_hours", [])        # [{"days":[0..6, 월=0], "from":"08:00", "to":"16:00"}]
+PAUSE_HOTKEY_KEYCODE = int(CONFIG.get("pause_hotkey_keycode", 35))   # P + 비상키와 같은 조합(ctrl+option+cmd)
+OMNI_STORE_DIR = os.path.expanduser("~/.omni/store")
+PRESENCE_PATH = os.path.join(OMNI_STORE_DIR, "presence.json")   # SP-1 → 옴니: 집 네트워크 여부
+QUIET_PATH = os.path.join(OMNI_STORE_DIR, "quiet_mode.json")    # 옴니/SP-1 공용: 수동 학교 모드
+PAUSE_LABELS = {"manual": "수동 일시정지", "away": "집 네트워크 아님", "schedule": "수업 시간표",
+                "quiet": "옴니 학교 모드"}
 UNLOCK_SEQUENCE = list(CONFIG.get("unlock_sequence",
                                   ["Thumb_Up", "ILoveYou", "Thumb_Up"]))
 STEP_HOLD_SEC = float(CONFIG.get("step_hold_sec", 0.8))
@@ -1106,6 +1119,187 @@ class ClapDetector:
         return fired
 
 # ──────────────────────────── 제스처 감시 스레드 ────────────────────────────
+def _norm_mac(s):
+    return ":".join(p.zfill(2) for p in str(s).lower().split(":")) if s else None
+
+
+def default_gateway_mac():
+    """(게이트웨이 IP, MAC) — 집 공유기 판별용. 네트워크가 없으면 (None, None)."""
+    try:
+        out = subprocess.run(["route", "-n", "get", "default"], capture_output=True, text=True, timeout=3).stdout
+        gw = next((l.split(":", 1)[1].strip() for l in out.splitlines() if "gateway:" in l), None)
+        if not gw:
+            return None, None
+        for attempt in range(2):
+            arp = subprocess.run(["arp", "-n", gw], capture_output=True, text=True, timeout=3).stdout
+            m = re.search(r"\bat ([0-9a-fA-F:]{11,17})\b", arp)
+            if m:
+                return gw, _norm_mac(m.group(1))
+            # ARP 캐시가 비었으면 한 번 찔러 채운다
+            subprocess.run(["ping", "-c", "1", "-W", "300", gw], capture_output=True, timeout=3)
+        return gw, None
+    except Exception:  # noqa: BLE001
+        return None, None
+
+
+def in_quiet_hours(now=None):
+    """config quiet_hours 시간표 안인가 (월=0). 자정을 넘는 구간도 허용."""
+    now = now or datetime.datetime.now()
+    hm = now.hour * 60 + now.minute
+    for rule in QUIET_HOURS or []:
+        try:
+            days = rule.get("days", [0, 1, 2, 3, 4])
+            if now.weekday() not in days:
+                continue
+            f = rule.get("from", "08:00").split(":")
+            t = rule.get("to", "16:00").split(":")
+            a, b = int(f[0]) * 60 + int(f[1]), int(t[0]) * 60 + int(t[1])
+            if (a <= hm < b) if a <= b else (hm >= a or hm < b):
+                return True
+        except (ValueError, AttributeError, IndexError):
+            continue
+    return False
+
+
+def read_quiet_file():
+    """옴니/SP-1 공용 학교 모드 파일 → (until, reason) 또는 None."""
+    try:
+        with open(QUIET_PATH) as f:
+            d = json.load(f)
+        if not d.get("on"):
+            return None
+        until = float(d.get("until") or 0)
+        if until and time.time() > until:
+            return None
+        return until, str(d.get("reason") or "manual")
+    except (OSError, ValueError):
+        return None
+
+
+def write_quiet_file(on, until=0.0, reason="manual", by="sp1"):
+    try:
+        os.makedirs(OMNI_STORE_DIR, exist_ok=True)
+        tmp = QUIET_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"on": bool(on), "until": float(until or 0), "reason": reason, "by": by,
+                       "ts": time.time()}, f, ensure_ascii=False)
+        os.replace(tmp, QUIET_PATH)
+    except OSError as e:
+        log(f"[!] 학교 모드 파일 쓰기 실패: {e}")
+
+
+def write_presence(home, gw, mac, home_only):
+    try:
+        os.makedirs(OMNI_STORE_DIR, exist_ok=True)
+        tmp = PRESENCE_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"home": bool(home), "gateway": gw, "mac": mac, "home_only": bool(home_only),
+                       "ts": time.time()}, f)
+        os.replace(tmp, PRESENCE_PATH)
+    except OSError:
+        pass
+
+
+class PauseController:
+    """카메라·마이크를 놓아야 하는 사유를 모아 하나의 답(reason)으로 만든다.
+
+    우선순위: 수동 정지 > 옴니 학교 모드 파일 > 수동 재개(자동 규칙 잠시 무시) > 집 밖 > 시간표.
+    """
+
+    def __init__(self):
+        self.manual = None            # ("pause"|"resume", until_ts 또는 0)
+        self.away = False
+        self.gateway = (None, None)
+        self.quiet = None             # (until, reason)
+        self.home_only = HOME_ONLY
+        self._lock = threading.Lock()
+
+    def reason(self, now=None):
+        now = now or time.time()
+        with self._lock:
+            m = self.manual
+            if m and m[1] and now > m[1]:
+                self.manual = m = None
+            if m and m[0] == "pause":
+                return "manual"
+            if self.quiet is not None:
+                until, why = self.quiet
+                if not until or now < until:
+                    return f"quiet:{why}"
+            if m and m[0] == "resume":
+                return None
+            if self.home_only and self.away:
+                return "away"
+            if in_quiet_hours():
+                return "schedule"
+            return None
+
+    @staticmethod
+    def label(reason):
+        if not reason:
+            return "켜짐"
+        key = reason.split(":")[0]
+        return PAUSE_LABELS.get(key, reason)
+
+    def pause(self, seconds=0, reason="manual"):
+        until = time.time() + seconds if seconds else 0.0
+        with self._lock:
+            self.manual = ("pause", until)
+        write_quiet_file(True, until, reason, by="sp1")   # 옴니도 함께 조용히
+        log(f"카메라 일시정지 요청 ({'무기한' if not seconds else f'{int(seconds // 60)}분'})")
+
+    def pause_until(self, until_ts, reason="manual"):
+        with self._lock:
+            self.manual = ("pause", float(until_ts))
+        write_quiet_file(True, until_ts, reason, by="sp1")
+        log(f"카메라 일시정지 요청 (~{datetime.datetime.fromtimestamp(until_ts):%H:%M})")
+
+    def resume(self, override_seconds=2 * 3600):
+        """수동 재개 — 집 밖/시간표 규칙을 override_seconds 동안 무시한다."""
+        with self._lock:
+            self.manual = ("resume", time.time() + override_seconds)
+            self.quiet = None
+        write_quiet_file(False, 0, "resume", by="sp1")
+        log("카메라 재개 요청 (자동 규칙 2시간 무시)")
+
+
+class PresenceMonitor(threading.Thread):
+    """집 네트워크 여부(기본 게이트웨이 MAC)와 학교 모드 파일을 주기적으로 읽어 PauseController에 반영."""
+
+    def __init__(self, pause):
+        super().__init__(daemon=True)
+        self.pause = pause
+
+    def run(self):
+        last_home = None
+        last_net_at = 0.0
+        warned = False
+        while True:
+            try:
+                self.pause.quiet = read_quiet_file()
+                now = time.time()
+                if now - last_net_at >= 20:
+                    last_net_at = now
+                    gw, mac = default_gateway_mac()
+                    if HOME_GATEWAY_MACS:
+                        home = mac is not None and mac in HOME_GATEWAY_MACS
+                    else:
+                        home = True
+                        if not warned:
+                            warned = True
+                            log("[!] home_gateway_macs 미설정 — 집 네트워크를 판정할 수 없어 항상 집으로 간주합니다")
+                    self.pause.away = not home
+                    self.pause.gateway = (gw, mac)
+                    write_presence(home, gw, mac, self.pause.home_only)
+                    if home != last_home:
+                        last_home = home
+                        log("집 네트워크 확인 → 카메라 사용 가능" if home
+                            else f"외부 네트워크 (게이트웨이 {mac or '없음'}) → 카메라·마이크 정지")
+            except Exception:  # noqa: BLE001 — 판정 실패가 감시를 죽이면 안 됨
+                pass
+            time.sleep(5)
+
+
 class GestureWatcher(threading.Thread):
     """카메라 프레임을 읽어 제스처를 분류하고 상태머신을 돌린다."""
 
@@ -1157,12 +1351,16 @@ class GestureWatcher(threading.Thread):
                 log(f"[!] 얼굴 텔레메트리 사용 불가: {e}")
                 face_lm = None
 
-        cap = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        if not cap.isOpened():
-            raise RuntimeError("카메라를 열 수 없습니다. 카메라 권한을 확인하세요.")
-        log("카메라 감시 시작")
+        def open_camera():
+            c = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
+            c.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            c.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            if not c.isOpened():
+                raise RuntimeError("카메라를 열 수 없습니다. 카메라 권한을 확인하세요.")
+            return c
+
+        cap = None          # 정지 사유가 없을 때만 루프 안에서 연다 — 학교에서는 아예 켜지지 않음
+        cam_opened_once = False
 
         stab = GestureStabilizer()
         clap = ClapDetector()
@@ -1175,7 +1373,7 @@ class GestureWatcher(threading.Thread):
             log(f"옴니 제스처 브리지 시작 (UDP {OMNI_GESTURE_PORT}, 유지 {OMNI_GESTURE_HOLD}s)")
         audio = None
         if TRIGGER_GESTURE == "Double_Clap" and CONFIG.get("clap_audio", True):
-            audio = AudioClapDetector()
+            audio = AudioClapDetector(autostart=False)   # 카메라와 함께 켜고 끈다 (마이크 표시도 없애기)
         hands_seen_at = -1e9      # 오디오 발동 게이트: 최근에 손이 보였는가
         HANDS_RECENT_SEC = 3.0
         prev_locked = False
@@ -1192,6 +1390,31 @@ class GestureWatcher(threading.Thread):
         last_frame_at = t0
 
         while not self.stop_flag.is_set():
+            # ---- 학교/시험 모드: 정지 사유가 있으면 카메라·마이크를 완전히 놓는다 (락다운 중엔 유지)
+            reason = None if self.app.locked else self.app.pause.reason()
+            if reason:
+                if cap is not None:
+                    cap.release()
+                    cap = None
+                    self.latest_frame = None
+                    if audio is not None:
+                        audio.stop()
+                    log(f"카메라·마이크 정지 — {PauseController.label(reason)}")
+                self.app.paused_reason = reason
+                time.sleep(0.5)
+                continue
+            if cap is None:
+                cap = open_camera()
+                if audio is not None:
+                    audio.start()
+                now0 = time.monotonic()
+                cooldown_until = now0 + STARTUP_GRACE_SEC
+                stab.consume(now0)
+                omni_stab.consume(now0)
+                omni_armed = True
+                self.app.paused_reason = None
+                log("카메라 감시 시작" if not cam_opened_once else "카메라 재개")
+                cam_opened_once = True
             ok, frame = cap.read()
             if not ok:
                 time.sleep(0.1)
@@ -1438,7 +1661,8 @@ class GestureWatcher(threading.Thread):
                     log("트리거 제스처 감지 → 락다운 요청")
                     AppHelper.callAfter(self.app.lockdown)
 
-        cap.release()
+        if cap is not None:
+            cap.release()
         if audio is not None:
             audio.stop()
 
@@ -1546,6 +1770,12 @@ class RemoteListener(threading.Thread):
             AppHelper.callAfter(self.app.remoteUnlock)
         elif cmd == "snap":
             self._snap()
+        elif cmd == "pause":
+            self.app.pause.pause(4 * 3600, "manual")
+            notify("SP-1 // 카메라·마이크 4시간 일시정지")
+        elif cmd == "resume":
+            self.app.pause.resume()
+            notify("SP-1 // 카메라 재개")
         elif cmd == "status":
             state = "LOCKED" if self.app.locked else "ARMED"
             if self.app.locked:
@@ -1596,7 +1826,121 @@ class SecurityApp(AppKit.NSObject):
         self.tap_source = None
         self.overlay_miss = 0
         self.hud_size = None
+        self.pause = PauseController()
+        self.paused_reason = None
+        self.status_item = None
+        self.status_menu_state = None
+        self.home_only_item = None
+        self._hotkey_monitor = None
         return self
+
+    # ── 메뉴 막대 아이콘: 카메라 상태를 항상 보여 주고, 누구나(선생님·IT 담당자) 끌 수 있게 ──
+    def setupStatusItem(self):
+        bar = AppKit.NSStatusBar.systemStatusBar()
+        self.status_item = bar.statusItemWithLength_(AppKit.NSVariableStatusItemLength)
+        menu = AppKit.NSMenu.alloc().init()
+        self.status_menu_state = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Security Protocol 1 — 상태 확인 중", None, "")
+        self.status_menu_state.setEnabled_(False)
+        menu.addItem_(self.status_menu_state)
+        menu.addItem_(AppKit.NSMenuItem.separatorItem())
+        for title, sel in (("카메라 일시정지 — 1시간", "menuPause1h:"),
+                           ("카메라 일시정지 — 4시간", "menuPause4h:"),
+                           ("카메라 일시정지 — 오늘 종일", "menuPauseToday:"),
+                           ("카메라 다시 켜기", "menuResume:")):
+            it = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, sel, "")
+            it.setTarget_(self)
+            menu.addItem_(it)
+        menu.addItem_(AppKit.NSMenuItem.separatorItem())
+        self.home_only_item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "집 네트워크에서만 카메라 사용", "menuToggleHomeOnly:", "")
+        self.home_only_item.setTarget_(self)
+        menu.addItem_(self.home_only_item)
+        menu.addItem_(AppKit.NSMenuItem.separatorItem())
+        for title, sel in (("로그 열기", "menuOpenLog:"), ("Security Protocol 1 종료", "menuQuit:")):
+            it = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, sel, "")
+            it.setTarget_(self)
+            menu.addItem_(it)
+        self.status_item.setMenu_(menu)
+        self.updateStatusItem()
+
+        # 전역 단축키 ctrl+option+command+P → 카메라 일시정지/재개 (손쉬운 사용 권한 필요)
+        want = (AppKit.NSEventModifierFlagControl | AppKit.NSEventModifierFlagOption
+                | AppKit.NSEventModifierFlagCommand)
+
+        def on_key(event):
+            try:
+                flags = int(event.modifierFlags()) & AppKit.NSEventModifierFlagDeviceIndependentFlagsMask
+                if event.keyCode() == PAUSE_HOTKEY_KEYCODE and (flags & want) == want:
+                    AppHelper.callAfter(self.togglePauseHotkey)
+            except Exception:  # noqa: BLE001
+                pass
+        self._hotkey_monitor = AppKit.NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+            AppKit.NSEventMaskKeyDown, on_key)
+
+    def updateStatusItem(self):
+        if self.status_item is None:
+            return
+        reason = self.pause.reason()
+        active = reason is None
+        btn = self.status_item.button()
+        if btn is not None:
+            btn.setTitle_("SP1 ●" if active else "SP1 ○")
+            btn.setToolTip_("Security Protocol 1 — 카메라 " + ("켜짐 (감시 중)" if active
+                            else "정지: " + PauseController.label(reason)))
+        if self.status_menu_state is not None:
+            m = self.pause.manual
+            tail = ""
+            if not active and m and m[0] == "pause" and m[1]:
+                tail = f" (~{datetime.datetime.fromtimestamp(m[1]):%H:%M})"
+            elif active and m and m[0] == "resume" and m[1]:
+                tail = f" (수동 재개 ~{datetime.datetime.fromtimestamp(m[1]):%H:%M})"
+            self.status_menu_state.setTitle_(
+                "카메라: 켜짐 — 감시 중" + tail if active
+                else f"카메라: 정지 — {PauseController.label(reason)}" + tail)
+        if self.home_only_item is not None:
+            self.home_only_item.setState_(1 if self.pause.home_only else 0)
+
+    def menuPause1h_(self, sender):
+        self.pause.pause(3600, "manual")
+        self.updateStatusItem()
+
+    def menuPause4h_(self, sender):
+        self.pause.pause(4 * 3600, "manual")
+        self.updateStatusItem()
+
+    def menuPauseToday_(self, sender):
+        end = datetime.datetime.now().replace(hour=23, minute=59, second=59, microsecond=0)
+        self.pause.pause_until(end.timestamp(), "manual")
+        self.updateStatusItem()
+
+    def menuResume_(self, sender):
+        self.pause.resume()
+        self.updateStatusItem()
+
+    def menuToggleHomeOnly_(self, sender):
+        self.pause.home_only = not self.pause.home_only
+        log(f"집 네트워크에서만 카메라 사용: {'ON' if self.pause.home_only else 'OFF'} (이번 실행 동안)")
+        self.updateStatusItem()
+
+    def menuOpenLog_(self, sender):
+        subprocess.Popen(["open", LOG_PATH])
+
+    def menuQuit_(self, sender):
+        if self.locked:
+            log("락다운 중에는 메뉴로 종료할 수 없습니다")
+            return
+        log("메뉴에서 종료 요청 — 다음 로그인(또는 launchctl kickstart)까지 꺼짐")
+        AppKit.NSApp().terminate_(None)
+
+    def togglePauseHotkey(self):
+        if self.pause.reason():
+            self.pause.resume()
+            play(SOUND_UNLOCK)
+        else:
+            self.pause.pause(4 * 3600, "manual")
+            play(SOUND_STEP)
+        self.updateStatusItem()
 
     # ── 이벤트 탭: 락다운 중에만 생성, 해제 시 완전 파괴 ──
     def _createTap(self):
@@ -1816,6 +2160,7 @@ class SecurityApp(AppKit.NSObject):
 
     # ── 워치독: 2초마다 상태 불변식 점검 ──
     def watchdogTick_(self, timer):
+        self.updateStatusItem()     # 메뉴 막대 상태(카메라 켜짐/정지 사유) 2초마다 갱신
         # 맥 잠금화면 중에는 판정 유예 — 오버레이가 WindowServer 목록에서
         # 빠져 보여도 락다운을 풀지 않는다 (전원 버튼 → 비번 복귀 시 유지)
         if session_screen_locked():
@@ -2015,8 +2360,13 @@ def main():
         if CONFIG_SRC != "config.local.json":
             log("[!] config.local.json 없음 — 예시 설정으로 동작 중. "
                 "config.example.json을 복사해 나만의 제스처로 바꾸세요.")
+        log("  학교 모드: " + ("집 네트워크에서만 카메라 사용" if HOME_ONLY else "네트워크 제한 없음")
+            + (f", 시간표 {len(QUIET_HOURS)}건" if QUIET_HOURS else "")
+            + " / 메뉴 막대 'SP1' 또는 ctrl+option+command+P로 즉시 정지")
+        controller.setupStatusItem()
         AppKit.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
             WATCHDOG_SEC, controller, "watchdogTick:", None, True)
+    PresenceMonitor(controller.pause).start()
 
     # App Nap 방지
     AppKit.NSProcessInfo.processInfo().beginActivityWithOptions_reason_(
