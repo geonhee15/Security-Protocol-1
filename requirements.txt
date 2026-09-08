@@ -1,4 +1,6 @@
-mediapipe>=1.0.0
+# 1.0.1은 launchd(자동 시작)에서 그래프를 열 때 Metal 서비스 불가로 크래시
+# (DrishtiMetalHelper "Service is unavailable") — 1.0.0 고정. 수동 실행은 두 버전 다 됨.
+mediapipe==1.0.0
 opencv-python>=4.10
 numpy
 pyobjc-framework-Quartz

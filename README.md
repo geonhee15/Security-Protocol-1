@@ -156,6 +156,12 @@ cd Security-Protocol-1
 
 `~/Library/LaunchAgents/com.<이름>.security-protocol-1.plist`를 만들어 `ProgramArguments`에 `<프로젝트경로>/venv/bin/python`과 `<프로젝트경로>/security_protocol.py`를 넣고 `RunAtLoad`/`KeepAlive`를 true로 설정한 뒤 `launchctl load` 하면 된다. launchd로 실행하면 python 바이너리 자체에 카메라/손쉬운 사용 권한을 부여해야 할 수 있다.
 
+## 복원·재설치 메모
+
+- `./setup.sh` → `./install-autostart.sh` 순서면 venv·모델·앱 번들·LaunchAgent가 전부 다시 만들어진다. `config.local.json`은 저장소에 없으니(gitignore) 트리거·해제 시퀀스·알림 설정은 다시 적어야 한다.
+- 앱 번들을 다시 만들면 ad-hoc 서명이 바뀌어 **카메라·손쉬운 사용·입력 모니터링 권한**을 시스템 설정에서 다시 허용해야 할 수 있다.
+- MediaPipe는 **1.0.0 고정**: 1.0.1은 launchd로 띄울 때 그래프 초기화에서 Metal 서비스를 못 찾아 즉시 크래시한다(`launchctl print`에 `last exit code = 78`만 남고 로그가 비어 보임). 터미널에서 수동 실행하면 둘 다 되므로 헷갈리기 쉽다.
+
 ## 한계
 
 - 전원 버튼 강제 재부팅은 소프트웨어로 막을 수 없다 — 재부팅 후에는 macOS 로그인 비밀번호가 최종 방어선이므로 **FileVault + 로그인 비밀번호**를 켜둘 것
