@@ -160,7 +160,8 @@ cd Security-Protocol-1
 
 - `./setup.sh` → `./install-autostart.sh` 순서면 venv·모델·앱 번들·LaunchAgent가 전부 다시 만들어진다. `config.local.json`은 저장소에 없으니(gitignore) 트리거·해제 시퀀스·알림 설정은 다시 적어야 한다.
 - 앱 번들을 다시 만들면 ad-hoc 서명이 바뀌어 **카메라·손쉬운 사용·입력 모니터링 권한**을 시스템 설정에서 다시 허용해야 할 수 있다.
-- MediaPipe는 **1.0.0 고정**: 1.0.1은 launchd로 띄울 때 그래프 초기화에서 Metal 서비스를 못 찾아 즉시 크래시한다(`launchctl print`에 `last exit code = 78`만 남고 로그가 비어 보임). 터미널에서 수동 실행하면 둘 다 되므로 헷갈리기 쉽다.
+- MediaPipe는 **1.0.0 고정**: 1.0.1은 launchd로 띄울 때 그래프 초기화에서 Metal 서비스를 못 찾아 즉시 크래시한다. 터미널에서 수동 실행하면 둘 다 되므로 헷갈리기 쉽다.
+- `launchctl print`에 `last exit code = 78`만 남고 `autostart.log`가 비어 있으면 스폰 자체가 실패한 것이다. 흔한 원인은 **다른 곳에서 만들어 옮겨 온 `autostart.log`** — launchd가 그 파일을 열지 못한다. 지우고(또는 `install-autostart.sh`가 회전시키게 두고) 다시 올리면 된다. 원인 격리는 같은 설정의 임시 plist에 `-c "print(1)"`를 넣어 띄워 보는 게 가장 빠르다.
 
 ## 한계
 

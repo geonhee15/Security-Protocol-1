@@ -52,6 +52,11 @@ EOF
 
 plutil -lint "$PLIST" >/dev/null
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+# 기존 로그 파일은 회전시킨다 — 다른 앱/셸이 만들어 옮겨 온 파일이면 launchd(xpcproxy)가
+# 열지 못해 스폰 자체가 실패한다(last exit code = 78, 로그 비어 있음). 새 파일은 launchd가 만든다.
+if [ -f "$DIR/autostart.log" ]; then
+  mv -f "$DIR/autostart.log" "$DIR/autostart.prev.log"
+fi
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
 
 echo ""
