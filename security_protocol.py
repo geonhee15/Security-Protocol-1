@@ -1176,6 +1176,17 @@ def read_quiet_file():
         return None
 
 
+def read_quiet_override():
+    """옴니에서 '집 밖 자동 모드 끄기'를 누르면 파일에 override_until이 온다 → 그때까지 자동 규칙 무시."""
+    try:
+        with open(QUIET_PATH) as f:
+            d = json.load(f)
+        ov = float(d.get("override_until") or 0)
+        return ov if ov > time.time() else 0.0
+    except (OSError, ValueError):
+        return 0.0
+
+
 def write_quiet_file(on, until=0.0, reason="manual", by="sp1"):
     try:
         os.makedirs(OMNI_STORE_DIR, exist_ok=True)
@@ -1277,6 +1288,9 @@ class PresenceMonitor(threading.Thread):
         while True:
             try:
                 self.pause.quiet = read_quiet_file()
+                ov = read_quiet_override()
+                if ov and (self.pause.manual is None or self.pause.manual[0] == "resume"):
+                    self.pause.manual = ("resume", ov)      # 옴니에서 집 밖 자동 모드를 잠시 껐음
                 now = time.time()
                 if now - last_net_at >= 20:
                     last_net_at = now
